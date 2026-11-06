@@ -1,7 +1,13 @@
 import { createClient } from "@supabase/supabase-js";
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || "";
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
+const DEFAULT_SUPABASE_URL = "https://bzusbywocpsqmwfokgsw.supabase.co";
+const DEFAULT_SUPABASE_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ6dXNieXdvY3BzcW13Zm9rZ3N3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM5ODU0MTIsImV4cCI6MjEwOTU2MTQxMn0.2kkQP_f30GH_KJqfpcWqKLdUijWFc8jKiEV9r1llQ9g";
+
+// Se tiver /rest/v1/ no final, limpa para pegar a base URL correta do Supabase
+const rawUrl = (import.meta.env.VITE_SUPABASE_URL || DEFAULT_SUPABASE_URL).trim();
+const supabaseUrl = rawUrl.replace(/\/rest\/v1\/?$/, "");
+const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || DEFAULT_SUPABASE_KEY).trim();
 
 export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
 
