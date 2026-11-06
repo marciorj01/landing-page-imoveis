@@ -13,3 +13,4 @@ AddDefaultCharset UTF-8
   AddType application/javascript js mjs
   AddType image/svg+xml svg svgz
 </IfModule>
+
