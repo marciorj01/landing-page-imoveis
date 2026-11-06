@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import LeadModal from "./LeadModal";
 
 const A = "/assets";
 const whatsapp =
@@ -161,6 +162,7 @@ function SectionHeading({
 export default function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [isScrolled, setIsScrolled] = useState(false);
+  const [isOasModalOpen, setIsOasModalOpen] = useState(false);
 
   useEffect(() => {
     const handleScroll = () => {
@@ -278,9 +280,24 @@ export default function App() {
               <h3>{property.name}</h3>
               <p className="property-description">{property.description}</p>
               <p className="property-detail">{property.detail}</p>
-              <a className="small-button" href={whatsapp} target="_blank" rel="noreferrer">
-                Ver detalhes
-              </a>
+              {property.name === "Oás" ? (
+                <button
+                  type="button"
+                  className="small-button cursor-pointer"
+                  onClick={() => setIsOasModalOpen(true)}
+                >
+                  Ver detalhes
+                </button>
+              ) : (
+                <a
+                  className="small-button"
+                  href={`https://wa.me/5541991080293?text=Ol%C3%A1%2C%20gostaria%20de%20informa%C3%A7%C3%B5es%20do%20${encodeURIComponent(property.name)}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Ver detalhes
+                </a>
+              )}
             </article>
           ))}
         </div>
@@ -429,6 +446,13 @@ export default function App() {
           </p>
         </div>
       </footer>
+
+      <LeadModal
+        isOpen={isOasModalOpen}
+        onClose={() => setIsOasModalOpen(false)}
+        propertyName="Oás"
+        targetUrl="/oas.html"
+      />
     </main>
   );
 }
