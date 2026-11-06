@@ -55,16 +55,18 @@ export default function LeadModal({
 
       setStatus("success");
 
-      // Redireciona para o material / landing page do OÁS
+      // Abre o material em uma nova aba e fecha o modal no site principal
       setTimeout(() => {
-        window.location.href = targetUrl;
-      }, 1200);
+        window.open(targetUrl, "_blank", "noopener,noreferrer");
+        onClose();
+      }, 1000);
     } catch (err) {
       console.error("Erro ao enviar lead:", err);
-      // Mesmo com erro de rede, redireciona para não travar o cliente
+      // Mesmo com erro de rede, abre o material para o cliente
       setTimeout(() => {
-        window.location.href = targetUrl;
-      }, 1000);
+        window.open(targetUrl, "_blank", "noopener,noreferrer");
+        onClose();
+      }, 800);
     } finally {
       setLoading(false);
     }
@@ -105,7 +107,7 @@ export default function LeadModal({
             </div>
             <h3 className="text-2xl font-semibold text-white">Dados recebidos!</h3>
             <p className="text-sm text-white/70">
-              Estamos preparando a apresentação exclusiva do <strong>{propertyName}</strong> para você...
+              Abrindo a apresentação exclusiva do <strong>{propertyName}</strong> em uma nova aba...
             </p>
           </div>
         ) : (
