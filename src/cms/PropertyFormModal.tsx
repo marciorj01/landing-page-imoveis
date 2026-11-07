@@ -152,7 +152,7 @@ export default function PropertyFormModal({
     if (!files || files.length === 0) return;
     setUploading(true);
     try {
-      const res = await uploadMedia(files[0]);
+      const res = await uploadMedia(files[0], "property-media");
       if (res?.url) {
         if (target === "main") {
           setForm((prev) => ({ ...prev, main_image: res.url }));

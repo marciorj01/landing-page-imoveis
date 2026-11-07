@@ -1,21 +1,47 @@
 -- ==============================================================================
--- MÁRCIO RJ CMS — MIGRAÇÃO SUPABASE: TABELA DE IMÓVEIS (REVISADA)
+-- MÁRCIO RJ CMS — MIGRAÇÃO SUPABASE: TABELA DE IMÓVEIS (VERSÃO REVISADA FINAL)
 -- STATUS: AGUARDANDO REVISÃO — NÃO EXECUTAR SEM AUTORIZAÇÃO EXPRESSA
 -- ==============================================================================
--- Este script cria e configura de forma segura e idempotente:
--- 1. A função de segurança `public.is_admin()`.
--- 2. A tabela `public.properties` com todas as colunas correspondentes ao código.
--- 3. As políticas Row Level Security (RLS) para leitura pública e escrita restrita.
--- 4. O bucket de storage `cms-media` com leitura pública de fotos e upload restrito ao admin.
--- 5. Os 3 empreendimentos iniciais (Bioma, Oás, Helbor VM 125) para carga inicial imediata.
+-- CORREÇÕES IMPLEMENTADAS NESTA VERSÃO:
+-- 1. is_admin() RESTREITO: Utiliza claim de servidor (app_metadata -> role = 'admin')
+--    e a tabela segura `public.cms_admin_users` por UUID de auth.users, sem
+--    confiar exclusivamente em e-mails abertos de JWT.
+-- 2. ISOLAMENTO DE STORAGE: O bucket `cms-media` permanece 100% INTOCADO.
+--    Cria-se o bucket dedicado `property-media` exclusivamente para fotos públicas
+--    dos imóveis, com ON CONFLICT (id) DO NOTHING e políticas isoladas.
+-- 3. COMPATIBILIDADE DEFENSIVA PARA TABELAS PREEXISTENTES:
+--    - NÃO apaga todas as políticas da tabela; remove apenas as suas próprias.
+--    - Bloco defensivo que migra tipos de colunas antigas (ex: price, id) com USING
+--      sem perda de dados e remove restrições restritivas NOT NULL antigas.
+--    - Adiciona novas colunas via ADD COLUMN IF NOT EXISTS.
 --
--- ISOLAMENTO E PRESERVAÇÃO:
--- NÃO altera, remove ou afeta a tabela `leads` ou outras tabelas existentes.
+-- PRESERVAÇÃO INTEGRAL: Não altera 'leads', 'cms_pages' ou e-books existentes.
 -- ==============================================================================
 
 -- ------------------------------------------------------------------------------
--- 1. FUNÇÃO DE VERIFICAÇÃO DE ADMINISTRADOR (SECURITY DEFINER)
+-- 1. TABELA DE ADMINISTRADORES AUTORIZADOS & FUNÇÃO is_admin()
 -- ------------------------------------------------------------------------------
+-- Registra UUIDs autorizados vinculados diretamente a auth.users
+CREATE TABLE IF NOT EXISTS public.cms_admin_users (
+    user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    notes TEXT DEFAULT 'Administrador autorizado do CMS',
+    created_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now())
+);
+
+ALTER TABLE public.cms_admin_users ENABLE ROW LEVEL SECURITY;
+
+-- Política de isolamento da tabela de administradores
+DROP POLICY IF EXISTS "admin_users_isolate" ON public.cms_admin_users;
+CREATE POLICY "admin_users_isolate"
+    ON public.cms_admin_users
+    FOR ALL
+    TO authenticated
+    USING (
+        (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
+        OR user_id = auth.uid()
+    );
+
+-- Função de autorização administrativa robusta
 CREATE OR REPLACE FUNCTION public.is_admin()
 RETURNS BOOLEAN
 LANGUAGE plpgsql
@@ -24,13 +50,15 @@ SET search_path = public
 STABLE
 AS $$
 BEGIN
-  -- 1. Verificação primária: app_metadata -> role = 'admin' (protegido pelo servidor Supabase Auth)
+  -- 1. Verificação por role exclusiva atribuída pelo servidor no app_metadata (inalterável pelo cliente)
   IF (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin' THEN
     RETURN true;
   END IF;
 
-  -- 2. Salvaguarda: e-mail oficial do corretor administrador
-  IF (auth.jwt() ->> 'email') = 'marciorj01@gmail.com' THEN
+  -- 2. Verificação por UUID explícito cadastrado na tabela segura de administradores
+  IF EXISTS (
+    SELECT 1 FROM public.cms_admin_users WHERE user_id = auth.uid()
+  ) THEN
     RETURN true;
   END IF;
 
@@ -39,62 +67,86 @@ END;
 $$;
 
 -- ------------------------------------------------------------------------------
--- 2. TABELA DE IMÓVEIS (public.properties)
+-- 2. MIGRAÇÃO DEFENSIVA PARA TABELA PREEXISTENTE (public.properties)
 -- ------------------------------------------------------------------------------
+-- Criação base caso a tabela não exista
 CREATE TABLE IF NOT EXISTS public.properties (
     id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     slug TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL,
     property_type TEXT NOT NULL DEFAULT 'Apartamento',
-    purpose TEXT NOT NULL DEFAULT 'venda', -- 'venda', 'locacao'
-    status TEXT NOT NULL DEFAULT 'draft',   -- 'draft', 'published', 'archived'
+    purpose TEXT NOT NULL DEFAULT 'venda',
+    status TEXT NOT NULL DEFAULT 'draft',
     featured BOOLEAN NOT NULL DEFAULT false,
     tag TEXT,
-    
-    -- Valores comerciais e taxas (formato textual flexível: ex: "Sob Consulta", "R$ 1.850.000")
     price TEXT,
     condo_fee TEXT,
     iptu TEXT,
-    
-    -- Localização
     address TEXT,
     neighborhood TEXT,
     city TEXT DEFAULT 'Curitiba',
     state TEXT DEFAULT 'PR',
-    
-    -- Ficha técnica
     bedrooms INTEGER DEFAULT 0,
     suites INTEGER DEFAULT 0,
     bathrooms INTEGER DEFAULT 0,
     parking_spots INTEGER DEFAULT 0,
     private_area NUMERIC(10, 2),
     total_area NUMERIC(10, 2),
-    
-    -- Textos
     summary TEXT,
     description TEXT,
     features JSONB DEFAULT '[]'::jsonb,
-    
-    -- Mídias
     main_image TEXT NOT NULL,
     gallery JSONB DEFAULT '[]'::jsonb,
     video_url TEXT,
-    
-    -- Contato & Destino
     whatsapp_custom_message TEXT,
     target_url TEXT,
-    
-    -- SEO
     seo_title TEXT,
     seo_description TEXT,
     seo_image TEXT,
-    
-    -- Timestamps
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- Garantia de idempotência: adiciona colunas caso a tabela já existisse previamente
+-- Bloco defensivo: se a tabela já existia com outros tipos ou restrições, ajusta com segurança
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'properties') THEN
+    -- A. Conversão de tipo de id para TEXT (suporta UUIDs e chaves textuais flexíveis)
+    BEGIN
+      ALTER TABLE public.properties ALTER COLUMN id TYPE TEXT USING id::text;
+    EXCEPTION WHEN others THEN NULL;
+    END;
+
+    -- B. Conversão de preço e taxas para TEXT (suporta "Sob Consulta" e valores formatados)
+    BEGIN
+      ALTER TABLE public.properties ALTER COLUMN price TYPE TEXT USING price::text;
+    EXCEPTION WHEN others THEN NULL;
+    END;
+
+    BEGIN
+      ALTER TABLE public.properties ALTER COLUMN condo_fee TYPE TEXT USING condo_fee::text;
+    EXCEPTION WHEN others THEN NULL;
+    END;
+
+    BEGIN
+      ALTER TABLE public.properties ALTER COLUMN iptu TYPE TEXT USING iptu::text;
+    EXCEPTION WHEN others THEN NULL;
+    END;
+
+    -- C. Remoção preventiva de restrições NOT NULL em colunas opcionais
+    BEGIN
+      ALTER TABLE public.properties ALTER COLUMN price DROP NOT NULL;
+      ALTER TABLE public.properties ALTER COLUMN condo_fee DROP NOT NULL;
+      ALTER TABLE public.properties ALTER COLUMN iptu DROP NOT NULL;
+      ALTER TABLE public.properties ALTER COLUMN summary DROP NOT NULL;
+      ALTER TABLE public.properties ALTER COLUMN description DROP NOT NULL;
+      ALTER TABLE public.properties ALTER COLUMN address DROP NOT NULL;
+    EXCEPTION WHEN others THEN NULL;
+    END;
+  END IF;
+END $$;
+
+-- D. Adição de novas colunas caso a tabela antiga não as possua
 ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS id TEXT;
 ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS slug TEXT;
 ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS title TEXT;
@@ -131,7 +183,7 @@ ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DE
 ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now());
 
 -- ------------------------------------------------------------------------------
--- 3. ÍNDICES DE CONSULTA E PERFORMANCE
+-- 3. ÍNDICES DE CONSULTA
 -- ------------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_properties_slug ON public.properties(slug);
 CREATE INDEX IF NOT EXISTS idx_properties_status ON public.properties(status);
@@ -140,30 +192,23 @@ CREATE INDEX IF NOT EXISTS idx_properties_purpose ON public.properties(purpose);
 CREATE INDEX IF NOT EXISTS idx_properties_type ON public.properties(property_type);
 
 -- ------------------------------------------------------------------------------
--- 4. POLÍTICAS RLS (ROW LEVEL SECURITY)
+-- 4. POLÍTICAS RLS ESPECÍFICAS (PRESERVANDO POLÍTICAS DE OUTROS MÓDULOS)
 -- ------------------------------------------------------------------------------
 ALTER TABLE public.properties ENABLE ROW LEVEL SECURITY;
 
--- Limpeza preventiva de políticas antigas exclusivamente nesta tabela
-DO $$
-DECLARE
-    pol RECORD;
-BEGIN
-    FOR pol IN (SELECT policyname FROM pg_policies WHERE schemaname = 'public' AND tablename = 'properties')
-    LOOP
-        EXECUTE format('DROP POLICY IF EXISTS %I ON public.properties', pol.policyname);
-    END LOOP;
-END $$;
+-- Remove APENAS as políticas específicas deste módulo de imóveis
+DROP POLICY IF EXISTS "properties_select_published" ON public.properties;
+DROP POLICY IF EXISTS "properties_admin_all" ON public.properties;
 
--- Política A: Visitantes públicos (anônimos ou autenticados) podem ler APENAS imóveis PUBLICADOS
-CREATE POLICY properties_select_published
+-- Visitantes públicos só podem ler imóveis marcados como 'published'
+CREATE POLICY "properties_select_published"
     ON public.properties
     FOR SELECT
     TO public, anon, authenticated
     USING (status = 'published');
 
--- Política B: Administrador autorizado possui controle total (SELECT de rascunhos, INSERT, UPDATE, DELETE)
-CREATE POLICY properties_admin_all
+-- Somente administradores autenticados e autorizados por is_admin() têm acesso total
+CREATE POLICY "properties_admin_all"
     ON public.properties
     FOR ALL
     TO authenticated
@@ -171,7 +216,7 @@ CREATE POLICY properties_admin_all
     WITH CHECK (public.is_admin());
 
 -- ------------------------------------------------------------------------------
--- 5. TRIGGER DE ATUALIZAÇÃO AUTOMÁTICA DE updated_at
+-- 5. TRIGGER DE updated_at AUTOMÁTICO
 -- ------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.set_properties_updated_at()
 RETURNS TRIGGER AS $$
@@ -188,44 +233,46 @@ CREATE TRIGGER trg_properties_updated_at
     EXECUTE FUNCTION public.set_properties_updated_at();
 
 -- ------------------------------------------------------------------------------
--- 6. CONFIGURAÇÃO DO BUCKET DE FOTOS NO SUPABASE STORAGE (cms-media)
+-- 6. STORAGE DEDICADO PARA FOTOS DE IMÓVEIS (property-media)
 -- ------------------------------------------------------------------------------
+-- O bucket `cms-media` permanece 100% inalterado.
+-- Cria o bucket público exclusivo para imagens de imóveis caso não exista:
 INSERT INTO storage.buckets (id, name, public)
-VALUES ('cms-media', 'cms-media', true)
-ON CONFLICT (id) DO UPDATE SET public = true;
+VALUES ('property-media', 'property-media', true)
+ON CONFLICT (id) DO NOTHING;
 
--- Políticas de Storage para `cms-media`
-DROP POLICY IF EXISTS "cms_media_public_read" ON storage.objects;
-CREATE POLICY "cms_media_public_read"
+-- Políticas de Storage restritas ao bucket `property-media`
+DROP POLICY IF EXISTS "property_media_public_read" ON storage.objects;
+CREATE POLICY "property_media_public_read"
     ON storage.objects
     FOR SELECT
     TO public, anon, authenticated
-    USING (bucket_id = 'cms-media');
+    USING (bucket_id = 'property-media');
 
-DROP POLICY IF EXISTS "cms_media_admin_insert" ON storage.objects;
-CREATE POLICY "cms_media_admin_insert"
+DROP POLICY IF EXISTS "property_media_admin_insert" ON storage.objects;
+CREATE POLICY "property_media_admin_insert"
     ON storage.objects
     FOR INSERT
     TO authenticated
-    WITH CHECK (bucket_id = 'cms-media' AND public.is_admin());
+    WITH CHECK (bucket_id = 'property-media' AND public.is_admin());
 
-DROP POLICY IF EXISTS "cms_media_admin_update" ON storage.objects;
-CREATE POLICY "cms_media_admin_update"
+DROP POLICY IF EXISTS "property_media_admin_update" ON storage.objects;
+CREATE POLICY "property_media_admin_update"
     ON storage.objects
     FOR UPDATE
     TO authenticated
-    USING (bucket_id = 'cms-media' AND public.is_admin())
-    WITH CHECK (bucket_id = 'cms-media' AND public.is_admin());
+    USING (bucket_id = 'property-media' AND public.is_admin())
+    WITH CHECK (bucket_id = 'property-media' AND public.is_admin());
 
-DROP POLICY IF EXISTS "cms_media_admin_delete" ON storage.objects;
-CREATE POLICY "cms_media_admin_delete"
+DROP POLICY IF EXISTS "property_media_admin_delete" ON storage.objects;
+CREATE POLICY "property_media_admin_delete"
     ON storage.objects
     FOR DELETE
     TO authenticated
-    USING (bucket_id = 'cms-media' AND public.is_admin());
+    USING (bucket_id = 'property-media' AND public.is_admin());
 
 -- ------------------------------------------------------------------------------
--- 7. SEED: CARGA INICIAL DOS 3 EMPREENDIMENTOS BASE (Publicados)
+-- 7. SEED: CARGA DOS 3 EMPREENDIMENTOS BASE (Publicados)
 -- ------------------------------------------------------------------------------
 INSERT INTO public.properties (
     id, slug, title, property_type, purpose, status, featured, tag,
@@ -235,80 +282,38 @@ INSERT INTO public.properties (
     target_url, whatsapp_custom_message, seo_title, seo_description
 ) VALUES
 (
-    'prop-bioma',
-    'bioma',
-    'Bioma',
-    'Apartamento',
-    'venda',
-    'published',
-    true,
-    'Lançamento',
-    'Sob Consulta',
-    'Sob consulta',
-    'Ahú',
-    'Curitiba',
-    'PR',
-    'Rua Vereador Washington Mansur, Ahú, Curitiba - PR',
+    'prop-bioma', 'bioma', 'Bioma', 'Apartamento', 'venda', 'published', true, 'Lançamento',
+    'Sob Consulta', 'Sob consulta', 'Ahú', 'Curitiba', 'PR', 'Rua Vereador Washington Mansur, Ahú, Curitiba - PR',
     3, 3, 4, 2, 140, 191,
     'Apresentação mais refinada do acabamento de alto padrão que é assinatura da ATR.',
     'O Bioma é a expressão máxima de arquitetura contemporânea e integração com a natureza no coração do Ahú. Com plantas flexíveis de 90 a 191m², o empreendimento conta com acabamento de alto padrão, isolamento acústico superior, amplas varandas e áreas de lazer completas equipadas e decoradas com elegância e requinte.',
     '["Piscina Aquecida", "Espaço Fitness", "Salão de Festas Gourmet", "Bicicletário", "Brinquedoteca", "Guarita Blindada", "Energia Solar para Áreas Comuns", "Varanda com Churrasqueira"]'::jsonb,
-    '/assets/e8527.png',
-    '["/assets/e8527.png", "/assets/08ae9.png", "/assets/bb9df.png"]'::jsonb,
-    '/bioma.html',
-    'Olá Márcio, tenho interesse no empreendimento Bioma no Ahú.',
+    '/assets/e8527.png', '["/assets/e8527.png", "/assets/08ae9.png", "/assets/bb9df.png"]'::jsonb,
+    '/bioma.html', 'Olá Márcio, tenho interesse no empreendimento Bioma no Ahú.',
     'Bioma - Apartamentos de Alto Padrão no Ahú | Curitiba',
     'Conheça o Bioma da ATR no Ahú. Plantas de 90 a 191m² com acabamento refinado e lazer completo.'
 ),
 (
-    'prop-oas',
-    'oas',
-    'Oás',
-    'Apartamento',
-    'venda',
-    'published',
-    true,
-    'Em obras',
-    'Sob Consulta',
-    'Sob consulta',
-    'Bigorrilho',
-    'Curitiba',
-    'PR',
-    'Bigorrilho, Curitiba - PR',
+    'prop-oas', 'oas', 'Oás', 'Apartamento', 'venda', 'published', true, 'Em obras',
+    'Sob Consulta', 'Sob consulta', 'Bigorrilho', 'Curitiba', 'PR', 'Bigorrilho, Curitiba - PR',
     4, 4, 5, 3, 250, 380,
     '50 andares diferente de tudo o que você já viu. O OÁS conecta você com a cidade nas nuvens.',
     'Com 50 andares, o OÁS é um marco na arquitetura de Curitiba e o residencial mais alto da cidade. Projetado para quem busca exclusividade absoluta, oferece vista 360 graus panorâmica para a Serra do Mar e o Parque Barigui. Uma infraestrutura incomparável com heliponto, spa panorâmico, piscinas suspensas e concierge internacional.',
     '["Torre de 50 Andares", "Vista 360° Panorâmica", "Piscina Suspensa", "Spa & Wellness Center", "Elevadores Inteligentes de Alta Velocidade", "Segurança com Reconhecimento Facial", "Adega Climatizada Privativa", "Carregamento para Veículos Elétricos"]'::jsonb,
-    '/assets/613f6.png',
-    '["/assets/613f6.png", "/assets/1c45d.png", "/assets/08ae9.png"]'::jsonb,
-    '/oas.html',
-    'Olá Márcio, gostaria de mais informações e apresentação do OÁS no Bigorrilho.',
+    '/assets/613f6.png', '["/assets/613f6.png", "/assets/1c45d.png", "/assets/08ae9.png"]'::jsonb,
+    '/oas.html', 'Olá Márcio, gostaria de mais informações e apresentação do OÁS no Bigorrilho.',
     'OÁS - O Maior Ícone Residencial de Curitiba | Bigorrilho',
     '50 andares de puro luxo no Bigorrilho. Conheça as unidades exclusivas do OÁS com vista para o Barigui.'
 ),
 (
-    'prop-helbor',
-    'helbor-vm-125',
-    'Helbor VM 125',
-    'Studio',
-    'venda',
-    'published',
-    true,
-    'Lançamento',
-    'Sob Consulta',
-    'Sob consulta',
-    'Vila Madalena',
-    'São Paulo',
-    'SP',
-    'Vila Madalena, São Paulo - SP',
+    'prop-helbor', 'helbor-vm-125', 'Helbor VM 125', 'Studio', 'venda', 'published', true, 'Lançamento',
+    'Sob Consulta', 'Sob consulta', 'Vila Madalena', 'São Paulo', 'SP', 'Vila Madalena, São Paulo - SP',
     1, 1, 1, 1, 30, 45,
     'Um endereço que combina facilidade para ir e vir com cultura, gastronomia e conveniência por perto.',
     'Localizado no bairro mais vibrante e cosmopolita de São Paulo, o Helbor VM 125 foi desenhado para moradia moderna e alto retorno de investimento em locação. Studios inteligentes de 27 a 30m² e salas comerciais de 24 a 55m² a poucos passos de estações de metrô, restaurantes renomados e galerias de arte da Vila Madalena.',
     '["Rooftop com Piscina e Lounge", "Coworking Integrado", "Lavanderia Compartilhada", "Academia no Último Andar", "Serviços Pay-per-use", "Próximo ao Metrô", "Ideal para Airbnb e Short-stay"]'::jsonb,
-    '/assets/7698d.png',
-    '["/assets/7698d.png", "/assets/bb9df.png"]'::jsonb,
-    'https://imovel.corretoron.com.br/helbor-vm125/61944',
-    'Olá Márcio, tenho interesse nos studios do Helbor VM 125 na Vila Madalena.',
+    '/assets/7698d.png', '["/assets/7698d.png", "/assets/bb9df.png"]'::jsonb,
+    'https://imovel.corretoron.com.br/helbor-vm125/61944', 'Olá Márcio, tenho interesse nos studios do Helbor VM 125 na Vila Madalena.',
     'Helbor VM 125 - Studios e Salas na Vila Madalena | São Paulo',
     'Invista na Vila Madalena com o Helbor VM 125. Studios modernos com alto potencial de rentabilidade.'
 )

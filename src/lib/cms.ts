@@ -305,34 +305,48 @@ export async function savePageData(
   }
 }
 
-export async function uploadMedia(file: File): Promise<{ url: string; error?: string } | null> {
+export async function uploadMedia(file: File, bucketName: string = "property-media"): Promise<{ url: string; error?: string } | null> {
   if (!supabase) return null;
   try {
     const fileExt = file.name.split(".").pop();
     const fileName = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}.${fileExt}`;
     const filePath = `uploads/${fileName}`;
 
-    const { error: uploadError } = await supabase.storage
-      .from("cms-media")
+    // Tenta primeiro no bucket especificado (ex: property-media para fotos de imóveis)
+    let activeBucket = bucketName;
+    let uploadRes = await supabase.storage
+      .from(activeBucket)
       .upload(filePath, file, { cacheControl: "3600", upsert: false });
 
-    if (uploadError) return { url: "", error: uploadError.message };
+    // Se o bucket não existir, tenta cms-media como contingência
+    if (uploadRes.error && activeBucket !== "cms-media") {
+      activeBucket = "cms-media";
+      uploadRes = await supabase.storage
+        .from(activeBucket)
+        .upload(filePath, file, { cacheControl: "3600", upsert: false });
+    }
+
+    if (uploadRes.error) return { url: "", error: uploadRes.error.message };
 
     const { data: publicUrlData } = supabase.storage
-      .from("cms-media")
+      .from(activeBucket)
       .getPublicUrl(filePath);
 
     const publicUrl = publicUrlData.publicUrl;
 
-    // Registra na tabela cms_media
-    await supabase.from("cms_media").insert([
-      {
-        name: file.name,
-        url: publicUrl,
-        size: file.size,
-        mime_type: file.type,
-      },
-    ]);
+    // Registra na tabela cms_media se existir
+    try {
+      await supabase.from("cms_media").insert([
+        {
+          name: file.name,
+          url: publicUrl,
+          size: file.size,
+          mime_type: file.type,
+        },
+      ]);
+    } catch {
+      // Ignora se cms_media ainda não tiver sido criada
+    }
 
     return { url: publicUrl };
   } catch (err: any) {
