@@ -35,6 +35,11 @@ const services = [
   },
 ];
 
+const propertyLandingPages: Record<string, string> = {
+  "Oás": "/oas.html",
+  "Bioma": "/bioma.html",
+};
+
 const properties = [
   {
     image: "e8527.png",
@@ -162,7 +167,10 @@ function SectionHeading({
 export default function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [isScrolled, setIsScrolled] = useState(false);
-  const [isOasModalOpen, setIsOasModalOpen] = useState(false);
+  const [activeLeadProperty, setActiveLeadProperty] = useState<{
+    name: string;
+    targetUrl: string;
+  } | null>(null);
 
   useEffect(() => {
     const handleScroll = () => {
@@ -280,11 +288,16 @@ export default function App() {
               <h3>{property.name}</h3>
               <p className="property-description">{property.description}</p>
               <p className="property-detail">{property.detail}</p>
-              {property.name === "Oás" ? (
+              {propertyLandingPages[property.name] ? (
                 <button
                   type="button"
                   className="small-button cursor-pointer"
-                  onClick={() => setIsOasModalOpen(true)}
+                  onClick={() =>
+                    setActiveLeadProperty({
+                      name: property.name,
+                      targetUrl: propertyLandingPages[property.name],
+                    })
+                  }
                 >
                   Ver detalhes
                 </button>
@@ -448,10 +461,10 @@ export default function App() {
       </footer>
 
       <LeadModal
-        isOpen={isOasModalOpen}
-        onClose={() => setIsOasModalOpen(false)}
-        propertyName="Oás"
-        targetUrl="/oas.html"
+        isOpen={Boolean(activeLeadProperty)}
+        onClose={() => setActiveLeadProperty(null)}
+        propertyName={activeLeadProperty?.name || ""}
+        targetUrl={activeLeadProperty?.targetUrl || "/oas.html"}
       />
     </main>
   );
