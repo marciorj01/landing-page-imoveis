@@ -145,3 +145,4 @@ CREATE POLICY "Admin pode fazer upload no bucket"
     TO authenticated
     USING (bucket_id = 'cms-media')
     WITH CHECK (bucket_id = 'cms-media');
+
