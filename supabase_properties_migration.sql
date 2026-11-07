@@ -2,24 +2,34 @@
 -- MÁRCIO RJ CMS — MIGRAÇÃO SUPABASE: TABELA DE IMÓVEIS (VERSÃO REVISADA FINAL)
 -- STATUS: AGUARDANDO REVISÃO — NÃO EXECUTAR SEM AUTORIZAÇÃO EXPRESSA
 -- ==============================================================================
--- REVISÕES E BLINDAGENS TÉCNICAS APLICADAS:
--- 1. POLÍTICAS RESTRICTIVE DO STORAGE:
---    - Tratamento explícito de NULL: `(bucket_id IS NULL OR bucket_id <> 'property-media')`
---      para INSERT, UPDATE e DELETE, impedindo que avaliações trivalentes (3VL)
---      bloqueiem inadvertidamente operações em outros buckets ou permitam escrita indevida.
---    - Protege integralmente o bucket `property-media` sem afetar `cms-media` ou outros.
---    - Preserva a leitura pública das imagens de imóveis via política permissiva de SELECT.
--- 2. VALIDAÇÃO RIGOROSA DE DADOS PREEXISTENTES:
---    - Antes de garantir PRIMARY KEY ou UNIQUE, valida se existem IDs nulos ou duplicados,
---      slugs nulos ou duplicados, ou registros sem título (`title`) ou foto (`main_image`).
---    - Se encontrar qualquer inconsistência, INTERROMPE a migração imediatamente via
---      `RAISE EXCEPTION` com mensagem detalhada, sem apagar dados nem inventar valores.
--- 3. REFORÇO DE SEGURANÇA EM is_admin():
---    - SECURITY DEFINER com `search_path = ''` fixo e referências de esquemas qualificadas.
---    - Aplicação explícita de `REVOKE ALL FROM PUBLIC` e concessão estrita via `GRANT EXECUTE`
---      somente aos papéis `anon`, `authenticated` e `service_role`.
---    - Impossibilidade de escalada de privilégios: validação exclusivamente por claims
---      de servidor (`app_metadata.role = 'admin'`) ou por UUID em `cms_admin_users`.
+-- REVISÕES E BLINDAGENS TÉCNICAS APLICADAS NESTA VERSÃO:
+-- 1. VERIFICAÇÃO RIGOROSA DE PRIMARY KEY EM `id`:
+--    - Consulta via catálogo do PostgreSQL (`pg_constraint` e `pg_attribute`) se
+--      existe chave primária composta EXCLUSIVAMENTE pela coluna `id`.
+--    - Se houver chave primária em outra(s) coluna(s), INTERROMPE a migração com
+--      erro explícito, sem remover ou substituir constraints existentes automaticamente.
+--    - Se não houver chave primária, cria-a em `id` somente após validar dados.
+-- 2. VERIFICAÇÃO RIGOROSA DE UNIQUE EM `slug`:
+--    - Consulta via catálogo do PostgreSQL (`pg_index`, `pg_class` e `pg_attribute`)
+--      se existe constraint UNIQUE ou índice único válido, não parcial (`indpred IS NULL`)
+--      e composto exclusivamente pela coluna `slug` (`indnatts = 1`).
+--    - Não utiliza buscas textuais frágeis em `indexdef`.
+--    - Se não existir unicidade global válida, cria a constraint após validar dados.
+-- 3. VALIDAÇÃO PRÉVIA E GARANTIA DE NOT NULL:
+--    - Valida ausência de NULLs em `id`, `slug`, `title` e `main_image`.
+--    - Valida ausência de duplicidades em `id` e `slug`.
+--    - Se encontrar qualquer inconsistência, aborta via `RAISE EXCEPTION` com mensagem
+--      detalhada, sem apagar registros nem inventar valores.
+--    - Somente após validação aprovada, aplica `SET NOT NULL` em `id`, `slug`, `title`
+--      e `main_image`.
+-- 4. STORAGE E PRIVILÉGIOS AUDITADOS:
+--    - Políticas RESTRICTIVE para INSERT, UPDATE e DELETE em `property-media` com
+--      tratamento explícito de NULL: `(bucket_id IS NULL OR bucket_id <> 'property-media')`.
+--    - Preserva leitura pública das imagens e impacto ZERO em outros buckets.
+--    - Função `is_admin()` com `REVOKE ALL FROM PUBLIC`, `GRANT EXECUTE` explícito
+--      para `anon`, `authenticated` e `service_role`, `search_path = ''` fixo e
+--      sem possibilidade de escalada de privilégios.
+--    - Bucket `cms-media` e tabela `leads` permanecem 100% INTOCADOS.
 -- ==============================================================================
 
 -- ------------------------------------------------------------------------------
@@ -78,7 +88,7 @@ BEGIN
     RETURN true;
   END IF;
 
-  -- 2. Verificação por UUID explícito cadastrado na tabela segura de administradores
+  -- 2. Verificação por UUID explícito cadastrado na tabela de administradores autorizados
   IF EXISTS (
     SELECT 1 FROM public.cms_admin_users WHERE user_id = auth.uid()
   ) THEN
@@ -175,6 +185,8 @@ DO $$
 DECLARE
     curr_type TEXT;
     err_count INTEGER;
+    existing_pk_cols TEXT;
+    has_valid_unique_slug BOOLEAN;
 BEGIN
     -- Executa verificações detalhadas caso a tabela 'properties' já existisse previamente
     IF EXISTS (
@@ -316,40 +328,52 @@ BEGIN
         END IF;
 
         -- ======================================================================
-        -- ETAPA III: GARANTIA E PRESERVAÇÃO DE RESTRIÇÕES (PRIMARY KEY & UNIQUE)
+        -- ETAPA III: GARANTIA DE NOT NULL APÓS VALIDAÇÕES APROVADAS
         -- ======================================================================
-        -- Garantir restrição PRIMARY KEY em 'id' (preserva se já existir)
-        IF NOT EXISTS (
-            SELECT 1
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-              AND tc.table_schema = kcu.table_schema
-            WHERE tc.table_schema = 'public'
-              AND tc.table_name = 'properties'
-              AND tc.constraint_type = 'PRIMARY KEY'
-        ) THEN
-            ALTER TABLE public.properties ADD PRIMARY KEY (id);
+        ALTER TABLE public.properties ALTER COLUMN id SET NOT NULL;
+        ALTER TABLE public.properties ALTER COLUMN slug SET NOT NULL;
+        ALTER TABLE public.properties ALTER COLUMN title SET NOT NULL;
+        ALTER TABLE public.properties ALTER COLUMN main_image SET NOT NULL;
+
+        -- ======================================================================
+        -- ETAPA IV: VERIFICAÇÃO E GARANTIA DE PRIMARY KEY EXCLUSIVAMENTE EM 'id'
+        -- ======================================================================
+        SELECT string_agg(a.attname, ',' ORDER BY array_position(c.conkey, a.attnum))
+        INTO existing_pk_cols
+        FROM pg_constraint c
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+        WHERE c.conrelid = 'public.properties'::regclass
+          AND c.contype = 'p';
+
+        IF existing_pk_cols IS NOT NULL THEN
+            -- Se já existe chave primária, ela DEVE ser composta exclusivamente pela coluna 'id'
+            IF existing_pk_cols <> 'id' THEN
+                RAISE EXCEPTION 'MIGRAÇÃO ABORTADA: A tabela public.properties possui PRIMARY KEY na(s) coluna(s) [%] em vez de exclusivamente em "id". Não é seguro alterar ou remover restrições automaticamente.', existing_pk_cols;
+            END IF;
+            -- Se já for exclusivamente 'id', preserva sem alteração
+        ELSE
+            -- Se não existe chave primária, cria especificamente na coluna 'id'
+            ALTER TABLE public.properties ADD CONSTRAINT properties_pkey PRIMARY KEY (id);
         END IF;
 
-        -- Garantir restrição UNIQUE em 'slug' (preserva se já existir)
-        IF NOT EXISTS (
+        -- ======================================================================
+        -- ETAPA V: VERIFICAÇÃO E GARANTIA DE UNIQUE EXCLUSIVAMENTE EM 'slug'
+        -- ======================================================================
+        -- Consulta via catálogo se existe constraint UNIQUE ou índice único válido,
+        -- não parcial (indpred IS NULL) e composto exclusivamente por 'slug' (indnatts = 1)
+        SELECT EXISTS (
             SELECT 1
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-              AND tc.table_schema = kcu.table_schema
-            WHERE tc.table_schema = 'public'
-              AND tc.table_name = 'properties'
-              AND tc.constraint_type = 'UNIQUE'
-              AND kcu.column_name = 'slug'
-        ) AND NOT EXISTS (
-            SELECT 1
-            FROM pg_indexes
-            WHERE schemaname = 'public'
-              AND tablename = 'properties'
-              AND indexdef ILIKE '%UNIQUE%slug%'
-        ) THEN
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = (i.indkey)[0]
+            WHERE i.indrelid = 'public.properties'::regclass
+              AND i.indisunique = true
+              AND i.indisvalid = true
+              AND i.indpred IS NULL
+              AND i.indnatts = 1
+              AND a.attname = 'slug'
+        ) INTO has_valid_unique_slug;
+
+        IF NOT has_valid_unique_slug THEN
             ALTER TABLE public.properties ADD CONSTRAINT properties_slug_key UNIQUE (slug);
         END IF;
 
