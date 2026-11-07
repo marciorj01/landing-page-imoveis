@@ -2,27 +2,24 @@
 -- MÁRCIO RJ CMS — MIGRAÇÃO SUPABASE: TABELA DE IMÓVEIS (VERSÃO REVISADA FINAL)
 -- STATUS: AGUARDANDO REVISÃO — NÃO EXECUTAR SEM AUTORIZAÇÃO EXPRESSA
 -- ==============================================================================
--- AJUSTES IMPLEMENTADOS:
--- 1. ORDEM DE EXECUÇÃO ESTRUTURAL CORRETA:
---    - Garante primeiro que todas as 30 colunas do modelo existam na tabela
---      (via CREATE TABLE IF NOT EXISTS e ADD COLUMN IF NOT EXISTS).
---    - Somente após todas as colunas existirem, executa o bloco defensivo que:
---      * Converte explicitamente tipos legados (id, price, condo_fee, iptu);
---      * Remove restrições NOT NULL antigas em campos opcionais;
---      * Verifica e preserva ou cria a restrição PRIMARY KEY em `id`;
---      * Verifica e preserva ou cria a restrição UNIQUE em `slug`.
---    - Eliminação completa de supressão de erros (sem EXCEPTION WHEN others THEN NULL).
--- 2. SEGURANÇA TOTAL EM `cms_admin_users`:
---    - Escrita (INSERT, UPDATE, DELETE) restrita exclusivamente a administradores
---      com claim de servidor `app_metadata -> role = 'admin'` (ou via service_role).
---    - Usuários comuns possuem ZERO permissão de escrita, eliminando escalada de privilégios.
--- 3. STORAGE BLINDADO CONTRA POLÍTICAS ANTIGAS EM `storage.objects`:
---    - O bucket `cms-media` permanece 100% INTOCADO.
---    - Cria o bucket dedicado `property-media` com ON CONFLICT (id) DO NOTHING.
---    - Adiciona políticas RESTRICTIVE para INSERT, UPDATE e DELETE em `storage.objects`:
---      garante que nenhuma política permissiva genérica ou legada permita escrita
---      de usuários não-administradores em `property-media`.
---    - Preserva integralmente todas as políticas e arquivos de outros buckets.
+-- REVISÕES E BLINDAGENS TÉCNICAS APLICADAS:
+-- 1. POLÍTICAS RESTRICTIVE DO STORAGE:
+--    - Tratamento explícito de NULL: `(bucket_id IS NULL OR bucket_id <> 'property-media')`
+--      para INSERT, UPDATE e DELETE, impedindo que avaliações trivalentes (3VL)
+--      bloqueiem inadvertidamente operações em outros buckets ou permitam escrita indevida.
+--    - Protege integralmente o bucket `property-media` sem afetar `cms-media` ou outros.
+--    - Preserva a leitura pública das imagens de imóveis via política permissiva de SELECT.
+-- 2. VALIDAÇÃO RIGOROSA DE DADOS PREEXISTENTES:
+--    - Antes de garantir PRIMARY KEY ou UNIQUE, valida se existem IDs nulos ou duplicados,
+--      slugs nulos ou duplicados, ou registros sem título (`title`) ou foto (`main_image`).
+--    - Se encontrar qualquer inconsistência, INTERROMPE a migração imediatamente via
+--      `RAISE EXCEPTION` com mensagem detalhada, sem apagar dados nem inventar valores.
+-- 3. REFORÇO DE SEGURANÇA EM is_admin():
+--    - SECURITY DEFINER com `search_path = ''` fixo e referências de esquemas qualificadas.
+--    - Aplicação explícita de `REVOKE ALL FROM PUBLIC` e concessão estrita via `GRANT EXECUTE`
+--      somente aos papéis `anon`, `authenticated` e `service_role`.
+--    - Impossibilidade de escalada de privilégios: validação exclusivamente por claims
+--      de servidor (`app_metadata.role = 'admin'`) ou por UUID em `cms_admin_users`.
 -- ==============================================================================
 
 -- ------------------------------------------------------------------------------
@@ -55,7 +52,7 @@ CREATE POLICY "admin_users_select"
 
 -- B. Escrita (INSERT, UPDATE, DELETE): EXCLUSIVA para quem já possui a role 'admin'
 -- emitida pelo servidor no app_metadata (ou via Supabase Dashboard / service_role).
--- Usuários comuns NUNCA podem cadastrar a si mesmos ou a terceiros.
+-- Usuários comuns NUNCA possuem permissão de inserção, alteração ou exclusão.
 CREATE POLICY "admin_users_write"
     ON public.cms_admin_users
     FOR ALL
@@ -67,12 +64,12 @@ CREATE POLICY "admin_users_write"
         (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
     );
 
--- Função de autorização administrativa robusta (SECURITY DEFINER)
+-- Função de autorização administrativa robusta (SECURITY DEFINER com search_path seguro)
 CREATE OR REPLACE FUNCTION public.is_admin()
 RETURNS BOOLEAN
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = ''
 STABLE
 AS $$
 BEGIN
@@ -81,7 +78,7 @@ BEGIN
     RETURN true;
   END IF;
 
-  -- 2. Verificação por UUID explícito cadastrado na tabela de administradores autorizados
+  -- 2. Verificação por UUID explícito cadastrado na tabela segura de administradores
   IF EXISTS (
     SELECT 1 FROM public.cms_admin_users WHERE user_id = auth.uid()
   ) THEN
@@ -92,10 +89,14 @@ BEGIN
 END;
 $$;
 
+-- Revogação de execução irrestrita pública e concessão explícita apenas aos papéis necessários
+REVOKE ALL ON FUNCTION public.is_admin() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.is_admin() TO anon, authenticated, service_role;
+
 -- ------------------------------------------------------------------------------
--- 2. TABELA DE IMÓVEIS (public.properties): GARANTIA DE COLUNAS & DEFENSIVIDADE
+-- 2. TABELA DE IMÓVEIS (public.properties): GARANTIA DE COLUNAS & VALIDAÇÃO
 -- ------------------------------------------------------------------------------
--- Passo 2.1: Criação base da tabela caso ainda não exista
+-- Passo 2.1: Criação estrutural base caso a tabela não exista
 CREATE TABLE IF NOT EXISTS public.properties (
     id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     slug TEXT NOT NULL UNIQUE,
@@ -169,10 +170,11 @@ ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS seo_image TEXT;
 ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now());
 ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now());
 
--- Passo 2.3: Bloco de validação, conversão explícita e garantia de restrições
+-- Passo 2.3: Bloco de validação de dados existentes, conversão explícita e restrições
 DO $$
 DECLARE
     curr_type TEXT;
+    err_count INTEGER;
 BEGIN
     -- Executa verificações detalhadas caso a tabela 'properties' já existisse previamente
     IF EXISTS (
@@ -180,7 +182,10 @@ BEGIN
         WHERE table_schema = 'public' AND table_name = 'properties'
     ) THEN
 
-        -- A. Garantir que 'id' seja TEXT (converte explicitamente caso fosse UUID ou outro tipo)
+        -- ======================================================================
+        -- ETAPA I: CONVERSÕES EXPLÍCITAS DE TIPOS (SEM SUPRESSÃO DE ERROS)
+        -- ======================================================================
+        -- A. Conversão de 'id' para TEXT caso fosse UUID ou outro tipo
         SELECT data_type INTO curr_type
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = 'properties' AND column_name = 'id';
@@ -189,7 +194,7 @@ BEGIN
             ALTER TABLE public.properties ALTER COLUMN id TYPE TEXT USING id::text;
         END IF;
 
-        -- B. Garantir que 'price' seja TEXT (suporta "Sob Consulta" e valores formatados)
+        -- B. Conversão de 'price' para TEXT (suporta "Sob Consulta" e valores formatados)
         SELECT data_type INTO curr_type
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = 'properties' AND column_name = 'price';
@@ -198,7 +203,7 @@ BEGIN
             ALTER TABLE public.properties ALTER COLUMN price TYPE TEXT USING price::text;
         END IF;
 
-        -- C. Garantir que 'condo_fee' seja TEXT
+        -- C. Conversão de 'condo_fee' para TEXT
         SELECT data_type INTO curr_type
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = 'properties' AND column_name = 'condo_fee';
@@ -207,7 +212,7 @@ BEGIN
             ALTER TABLE public.properties ALTER COLUMN condo_fee TYPE TEXT USING condo_fee::text;
         END IF;
 
-        -- D. Garantir que 'iptu' seja TEXT
+        -- D. Conversão de 'iptu' para TEXT
         SELECT data_type INTO curr_type
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = 'properties' AND column_name = 'iptu';
@@ -216,7 +221,7 @@ BEGIN
             ALTER TABLE public.properties ALTER COLUMN iptu TYPE TEXT USING iptu::text;
         END IF;
 
-        -- E. Remoção explícita de restrições NOT NULL em colunas opcionais
+        -- E. Remoção de restrições NOT NULL em colunas opcionais legadas
         IF EXISTS (
             SELECT 1 FROM information_schema.columns
             WHERE table_schema = 'public' AND table_name = 'properties'
@@ -265,7 +270,55 @@ BEGIN
             ALTER TABLE public.properties ALTER COLUMN address DROP NOT NULL;
         END IF;
 
-        -- F. Garantir que 'id' possua restrição PRIMARY KEY (preserva se já existir)
+        -- ======================================================================
+        -- ETAPA II: VALIDAÇÃO RIGOROSA DOS DADOS PREEXISTENTES
+        -- Se houver inconsistências, aborta a migração imediatamente sem apagar
+        -- dados nem inventar valores.
+        -- ======================================================================
+        -- 1. Validar registros com 'id' NULO
+        SELECT COUNT(*) INTO err_count FROM public.properties WHERE id IS NULL;
+        IF err_count > 0 THEN
+            RAISE EXCEPTION 'MIGRAÇÃO ABORTADA: A tabela public.properties contém % registro(s) com "id" NULO. Regularize os identificadores antes de aplicar a PRIMARY KEY.', err_count;
+        END IF;
+
+        -- 2. Validar registros com 'id' duplicado
+        SELECT COUNT(*) INTO err_count FROM (
+            SELECT id FROM public.properties WHERE id IS NOT NULL GROUP BY id HAVING COUNT(*) > 1
+        ) dupes;
+        IF err_count > 0 THEN
+            RAISE EXCEPTION 'MIGRAÇÃO ABORTADA: A tabela public.properties contém % "id"(s) duplicados. Remova ou corrija as duplicidades antes de aplicar a PRIMARY KEY.', err_count;
+        END IF;
+
+        -- 3. Validar registros com 'slug' NULO
+        SELECT COUNT(*) INTO err_count FROM public.properties WHERE slug IS NULL;
+        IF err_count > 0 THEN
+            RAISE EXCEPTION 'MIGRAÇÃO ABORTADA: A tabela public.properties contém % registro(s) com "slug" NULO. Cada imóvel deve possuir um slug único.', err_count;
+        END IF;
+
+        -- 4. Validar registros com 'slug' duplicado
+        SELECT COUNT(*) INTO err_count FROM (
+            SELECT slug FROM public.properties WHERE slug IS NOT NULL GROUP BY slug HAVING COUNT(*) > 1
+        ) dupes;
+        IF err_count > 0 THEN
+            RAISE EXCEPTION 'MIGRAÇÃO ABORTADA: A tabela public.properties contém % "slug"(s) duplicados. Corrija as duplicidades antes de aplicar a restrição UNIQUE.', err_count;
+        END IF;
+
+        -- 5. Validar registros sem 'title' preenchido
+        SELECT COUNT(*) INTO err_count FROM public.properties WHERE title IS NULL OR trim(title) = '';
+        IF err_count > 0 THEN
+            RAISE EXCEPTION 'MIGRAÇÃO ABORTADA: A tabela public.properties contém % registro(s) sem "title" preenchido. O título comercial é obrigatório.', err_count;
+        END IF;
+
+        -- 6. Validar registros sem 'main_image' preenchida
+        SELECT COUNT(*) INTO err_count FROM public.properties WHERE main_image IS NULL OR trim(main_image) = '';
+        IF err_count > 0 THEN
+            RAISE EXCEPTION 'MIGRAÇÃO ABORTADA: A tabela public.properties contém % registro(s) sem "main_image" preenchida. A imagem principal é obrigatória.', err_count;
+        END IF;
+
+        -- ======================================================================
+        -- ETAPA III: GARANTIA E PRESERVAÇÃO DE RESTRIÇÕES (PRIMARY KEY & UNIQUE)
+        -- ======================================================================
+        -- Garantir restrição PRIMARY KEY em 'id' (preserva se já existir)
         IF NOT EXISTS (
             SELECT 1
             FROM information_schema.table_constraints tc
@@ -279,7 +332,7 @@ BEGIN
             ALTER TABLE public.properties ADD PRIMARY KEY (id);
         END IF;
 
-        -- G. Garantir que 'slug' possua restrição UNIQUE (preserva se já existir)
+        -- Garantir restrição UNIQUE em 'slug' (preserva se já existir)
         IF NOT EXISTS (
             SELECT 1
             FROM information_schema.table_constraints tc
@@ -393,10 +446,11 @@ CREATE POLICY "property_media_admin_delete"
     USING (bucket_id = 'property-media' AND public.is_admin());
 
 -- 6.2. Políticas RESTRICTIVE de blindagem contra políticas genéricas antigas em storage.objects
--- Em PostgreSQL, políticas RESTRICTIVE são combinadas via AND com qualquer política permissiva existente.
--- Para qualquer outro bucket (bucket_id <> 'property-media'), a condição é TRUE (impacto zero em outros buckets).
--- Para 'property-media', ela EXIGE que o usuário seja autenticado e is_admin(), bloqueando
--- qualquer upload/modificação indevida originada de políticas antigas permissivas que possam existir.
+-- Tratamento explícito de NULL: `(bucket_id IS NULL OR bucket_id <> 'property-media')`
+-- Em PostgreSQL, políticas RESTRICTIVE combinam com AND sobre as permissivas.
+-- Para qualquer outro bucket (ou bucket nulo), a condição é TRUE (impacto zero em outros buckets).
+-- Para 'property-media', a condição EXIGE que o usuário seja autenticado e is_admin(),
+-- bloqueando tentativas de escrita indevidas originadas de políticas antigas genéricas.
 DROP POLICY IF EXISTS "property_media_restrictive_insert" ON storage.objects;
 CREATE POLICY "property_media_restrictive_insert"
     ON storage.objects
@@ -404,7 +458,8 @@ CREATE POLICY "property_media_restrictive_insert"
     FOR INSERT
     TO public
     WITH CHECK (
-        bucket_id <> 'property-media' OR (auth.role() = 'authenticated' AND public.is_admin())
+        (bucket_id IS NULL OR bucket_id <> 'property-media')
+        OR (auth.role() = 'authenticated' AND public.is_admin())
     );
 
 DROP POLICY IF EXISTS "property_media_restrictive_update" ON storage.objects;
@@ -414,10 +469,12 @@ CREATE POLICY "property_media_restrictive_update"
     FOR UPDATE
     TO public
     USING (
-        bucket_id <> 'property-media' OR (auth.role() = 'authenticated' AND public.is_admin())
+        (bucket_id IS NULL OR bucket_id <> 'property-media')
+        OR (auth.role() = 'authenticated' AND public.is_admin())
     )
     WITH CHECK (
-        bucket_id <> 'property-media' OR (auth.role() = 'authenticated' AND public.is_admin())
+        (bucket_id IS NULL OR bucket_id <> 'property-media')
+        OR (auth.role() = 'authenticated' AND public.is_admin())
     );
 
 DROP POLICY IF EXISTS "property_media_restrictive_delete" ON storage.objects;
@@ -427,7 +484,8 @@ CREATE POLICY "property_media_restrictive_delete"
     FOR DELETE
     TO public
     USING (
-        bucket_id <> 'property-media' OR (auth.role() = 'authenticated' AND public.is_admin())
+        (bucket_id IS NULL OR bucket_id <> 'property-media')
+        OR (auth.role() = 'authenticated' AND public.is_admin())
     );
 
 -- ------------------------------------------------------------------------------
