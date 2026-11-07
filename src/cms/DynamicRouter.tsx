@@ -8,7 +8,7 @@ import LoginPage from "./LoginPage";
 import AdminDashboard from "./AdminDashboard";
 
 export default function DynamicRouter() {
-  const { user, loading: authLoading } = useAuth();
+  const { user, isAdmin, loading: authLoading } = useAuth();
 
   const [currentPath, setCurrentPath] = useState(window.location.pathname);
   const [currentSearch, setCurrentSearch] = useState(window.location.search);
@@ -35,19 +35,29 @@ export default function DynamicRouter() {
   const isAdminRoute =
     currentPath.startsWith("/gestao-restrita") || currentHash.startsWith("#/gestao-restrita");
 
-  const isPreview =
-    currentPath.startsWith("/preview/") ||
-    new URLSearchParams(currentSearch).get("preview") === "draft";
+  const isPreviewRoute = currentPath.startsWith("/preview/");
+  const hasPreviewParam = new URLSearchParams(currentSearch).get("preview") === "draft";
+
+  // O modo de preview é estritamente condicionado à autenticação e autorização do administrador
+  // Visitantes anônimos ou usuários comuns NUNCA podem ativar isPreview
+  const isAuthorizedPreview = isAdmin && (isPreviewRoute || hasPreviewParam);
 
   // Carrega página e menus
   useEffect(() => {
     if (isAdminRoute) return;
 
+    // Se estiver em rota de preview mas não for admin e ainda estiver carregando auth, aguarda
+    if (isPreviewRoute && authLoading) return;
+
+    // Se estiver em rota de preview e não for admin, não carrega nada (o guard de rota cuidará)
+    if (isPreviewRoute && !isAdmin) return;
+
     let isMounted = true;
     let slug = "home";
 
-    if (currentPath.startsWith("/preview/")) {
-      slug = currentPath.replace("/preview/", "").replace(/^\//, "");
+    if (isPreviewRoute) {
+      const extractedSlug = currentPath.replace("/preview/", "").replace(/^\//, "");
+      slug = extractedSlug || "home";
     } else {
       const cleanPath = currentPath.replace(/^\//, "").replace(/\/$/, "");
       if (cleanPath && cleanPath !== "index.html") {
@@ -58,7 +68,7 @@ export default function DynamicRouter() {
     setPageLoading(true);
     setPageNotFound(false);
 
-    Promise.all([getPageBySlug(slug, isPreview), getMenus()])
+    Promise.all([getPageBySlug(slug, isAuthorizedPreview), getMenus()])
       .then(([page, loadedMenus]) => {
         if (!isMounted) return;
         setPageSchema(page);
@@ -80,7 +90,7 @@ export default function DynamicRouter() {
     return () => {
       isMounted = false;
     };
-  }, [currentPath, currentSearch, currentHash, isAdminRoute, isPreview]);
+  }, [currentPath, currentSearch, currentHash, isAdminRoute, isPreviewRoute, isAuthorizedPreview, authLoading, isAdmin]);
 
   // ROTA 1: Painel Administrativo do CMS
   if (isAdminRoute) {
@@ -93,10 +103,54 @@ export default function DynamicRouter() {
     }
 
     if (user) {
+      if (!isAdmin) {
+        return (
+          <div className="min-h-screen flex flex-col items-center justify-center bg-[#060c1d] text-white px-4 text-center">
+            <h1 className="text-3xl font-bold text-red-400 mb-3">Acesso Não Autorizado</h1>
+            <p className="text-gray-300 max-w-md mb-6">
+              Sua conta ({user.email}) não possui permissão de administrador para gerenciar o CMS.
+            </p>
+            <a
+              href="/"
+              className="px-5 py-2.5 rounded bg-[#c5a880] text-[#060c1d] font-bold text-sm uppercase tracking-wider"
+            >
+              Voltar ao Site
+            </a>
+          </div>
+        );
+      }
       return <AdminDashboard />;
     }
 
     return <LoginPage />;
+  }
+
+  // ROTA DE PREVIEW PROTEGIDA: Se um usuário não admin acessar /preview/:slug
+  if (isPreviewRoute) {
+    if (authLoading) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-[#060c1d] text-[#c5a880] text-sm font-semibold tracking-wider uppercase">
+          Verificando autorização de pré-visualização...
+        </div>
+      );
+    }
+
+    if (!isAdmin) {
+      return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-[#060c1d] text-white px-4 text-center">
+          <h1 className="text-3xl font-bold text-red-400 mb-3">Pré-visualização Restrita</h1>
+          <p className="text-gray-300 max-w-md mb-6">
+            A visualização de rascunhos é exclusiva para o administrador autorizado do CMS.
+          </p>
+          <a
+            href="/gestao-restrita"
+            className="px-6 py-2.5 rounded bg-[#c5a880] text-[#060c1d] font-bold text-sm uppercase tracking-wider"
+          >
+            Fazer Login como Administrador
+          </a>
+        </div>
+      );
+    }
   }
 
   // ROTA 2: Página 404 (quando uma rota dinâmica não existe)
@@ -118,10 +172,10 @@ export default function DynamicRouter() {
     );
   }
 
-  // ROTA 3: Site Público / Preview
+  // ROTA 3: Site Público / Preview Autorizado
   return (
     <>
-      {isPreview && (
+      {isAuthorizedPreview && (
         <div className="bg-amber-500 text-stone-900 py-2 px-4 text-center text-xs font-bold uppercase tracking-wider sticky top-0 z-50 flex items-center justify-center gap-3 shadow-md">
           <span>⚠️ Modo Pré-visualização: Visualizando rascunho de &quot;{pageSchema.slug}&quot; (não publicado)</span>
           <a

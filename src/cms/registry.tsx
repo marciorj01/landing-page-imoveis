@@ -120,3 +120,4 @@ export const BLOCK_REGISTRY: Record<string, ComponentMetadata> = {
     component: CustomTextBlock,
   },
 };
+

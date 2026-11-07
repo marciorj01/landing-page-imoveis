@@ -59,15 +59,17 @@ const DEFAULT_PARTNERS: PartnerData[] = [
 export default function PartnersBlock({
   eyebrow = "Soluções que ampliam suas possibilidades",
   title = "Parcerias que conectam as melhores oportunidades",
-  partners = DEFAULT_PARTNERS,
+  partners,
 }: Partial<PartnersBlockProps>) {
+  const activePartners = partners && partners.length > 0 ? partners : DEFAULT_PARTNERS;
+
   return (
     <section className="solutions page-shell" id="solucoes">
       <SectionHeading eyebrow={eyebrow} lineAsset="c5e5c.svg">
         <h2>{title}</h2>
       </SectionHeading>
       <div className="partners-grid">
-        {partners.map((partner, index) => (
+        {activePartners.map((partner, index) => (
           <article className="partner-card" key={partner.title}>
             <div className="partner-logo-frame">
               <img
@@ -103,3 +105,4 @@ export default function PartnersBlock({
     </section>
   );
 }
+

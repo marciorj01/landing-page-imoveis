@@ -195,3 +195,4 @@ VALUES
   ('menu-3', 'Soluções', '#solucoes', 2, true),
   ('menu-4', 'Sobre', '#sobre', 3, true)
 ON CONFLICT (id) DO NOTHING;
+

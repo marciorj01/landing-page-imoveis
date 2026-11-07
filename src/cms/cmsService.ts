@@ -86,3 +86,4 @@ export async function getMenus(): Promise<MenuItem[]> {
     return DEFAULT_MENU_ITEMS;
   }
 }
+

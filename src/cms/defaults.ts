@@ -61,7 +61,6 @@ export const DEFAULT_HOME_PAGE_SCHEMA: PageSchema = {
       type: "PartnersBlock",
       eyebrow: "Soluções que ampliam suas possibilidades",
       title: "Parcerias que conectam as melhores oportunidades",
-      partners: [],
       visible: true,
     },
     {
@@ -82,3 +81,4 @@ export const DEFAULT_HOME_PAGE_SCHEMA: PageSchema = {
     },
   ],
 };
+
