@@ -38,6 +38,7 @@ const services = [
 const propertyLandingPages: Record<string, string> = {
   "Oás": "/oas.html",
   "Bioma": "/bioma.html",
+  "Helbor VM 125": "https://imovel.corretoron.com.br/helbor-vm125/61944",
 };
 
 const properties = [
@@ -270,9 +271,6 @@ export default function App() {
         <SectionHeading eyebrow="Imóveis em destaque" lineAsset="00449.svg">
           <p>Projetos que combinam localização, arquitetura e potencial.</p>
         </SectionHeading>
-        <a className="property-arrow" href="#sobre" aria-label="Conheça a consultoria">
-          <img src={`${A}/92af9.svg`} alt="" />
-        </a>
         <div className="properties-grid">
           {properties.map((property) => (
             <article className="property-card" key={property.name}>
