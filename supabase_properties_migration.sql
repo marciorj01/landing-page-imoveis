@@ -2,22 +2,27 @@
 -- MÁRCIO RJ CMS — MIGRAÇÃO SUPABASE: TABELA DE IMÓVEIS (VERSÃO REVISADA FINAL)
 -- STATUS: AGUARDANDO REVISÃO — NÃO EXECUTAR SEM AUTORIZAÇÃO EXPRESSA
 -- ==============================================================================
--- AJUSTES OBRIGATÓRIOS IMPLEMENTADOS:
--- 1. SEGURANÇA TOTAL EM `cms_admin_users`:
---    - Removida qualquer permissão de escrita para usuários comuns.
---    - Escrita (INSERT, UPDATE, DELETE) restrita estritamente a quem já possui a
---      claim de servidor `app_metadata -> role = 'admin'` (ou via service_role).
---    - Elimina completamente o risco de escalada de privilégios.
--- 2. CONFIABILIDADE E ROBUSTEZ DA MIGRAÇÃO:
---    - Removidos todos os blocos de supressão de erro (EXCEPTION WHEN others THEN NULL).
---    - Conversões de tipos explícitas com USING ...::text baseadas na inspeção de
---      information_schema.columns. Se houver erro, a migração falha imediatamente.
---    - Verificação e garantia de PRIMARY KEY em `id`.
---    - Verificação e garantia de restrição UNIQUE em `slug`.
---    - Preservação integral das restrições caso já existam no banco.
--- 3. PRESERVAÇÃO INTEGRAL:
---    - NÃO altera a tabela `leads`, os e-books ou o bucket `cms-media`.
---    - Storage isolado no bucket `property-media` com ON CONFLICT (id) DO NOTHING.
+-- AJUSTES IMPLEMENTADOS:
+-- 1. ORDEM DE EXECUÇÃO ESTRUTURAL CORRETA:
+--    - Garante primeiro que todas as 30 colunas do modelo existam na tabela
+--      (via CREATE TABLE IF NOT EXISTS e ADD COLUMN IF NOT EXISTS).
+--    - Somente após todas as colunas existirem, executa o bloco defensivo que:
+--      * Converte explicitamente tipos legados (id, price, condo_fee, iptu);
+--      * Remove restrições NOT NULL antigas em campos opcionais;
+--      * Verifica e preserva ou cria a restrição PRIMARY KEY em `id`;
+--      * Verifica e preserva ou cria a restrição UNIQUE em `slug`.
+--    - Eliminação completa de supressão de erros (sem EXCEPTION WHEN others THEN NULL).
+-- 2. SEGURANÇA TOTAL EM `cms_admin_users`:
+--    - Escrita (INSERT, UPDATE, DELETE) restrita exclusivamente a administradores
+--      com claim de servidor `app_metadata -> role = 'admin'` (ou via service_role).
+--    - Usuários comuns possuem ZERO permissão de escrita, eliminando escalada de privilégios.
+-- 3. STORAGE BLINDADO CONTRA POLÍTICAS ANTIGAS EM `storage.objects`:
+--    - O bucket `cms-media` permanece 100% INTOCADO.
+--    - Cria o bucket dedicado `property-media` com ON CONFLICT (id) DO NOTHING.
+--    - Adiciona políticas RESTRICTIVE para INSERT, UPDATE e DELETE em `storage.objects`:
+--      garante que nenhuma política permissiva genérica ou legada permita escrita
+--      de usuários não-administradores em `property-media`.
+--    - Preserva integralmente todas as políticas e arquivos de outros buckets.
 -- ==============================================================================
 
 -- ------------------------------------------------------------------------------
@@ -88,9 +93,9 @@ END;
 $$;
 
 -- ------------------------------------------------------------------------------
--- 2. TABELA DE IMÓVEIS (public.properties) & MIGRAÇÃO DEFENSIVA EXPLÍCITA
+-- 2. TABELA DE IMÓVEIS (public.properties): GARANTIA DE COLUNAS & DEFENSIVIDADE
 -- ------------------------------------------------------------------------------
--- Criação estrutural base caso a tabela não exista
+-- Passo 2.1: Criação base da tabela caso ainda não exista
 CREATE TABLE IF NOT EXISTS public.properties (
     id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     slug TEXT NOT NULL UNIQUE,
@@ -128,7 +133,43 @@ CREATE TABLE IF NOT EXISTS public.properties (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- Bloco defensivo de validação e conversão explícita (sem silenciamento de erros)
+-- Passo 2.2: Adição idempotente de todas as colunas ANTES de qualquer validação de restrição
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS id TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS slug TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS property_type TEXT DEFAULT 'Apartamento';
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS purpose TEXT DEFAULT 'venda';
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'draft';
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT false;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS tag TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS price TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS condo_fee TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS iptu TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS address TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS neighborhood TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS city TEXT DEFAULT 'Curitiba';
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS state TEXT DEFAULT 'PR';
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS bedrooms INTEGER DEFAULT 0;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS suites INTEGER DEFAULT 0;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS bathrooms INTEGER DEFAULT 0;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS parking_spots INTEGER DEFAULT 0;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS private_area NUMERIC(10, 2);
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS total_area NUMERIC(10, 2);
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS summary TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS features JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS main_image TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS gallery JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS video_url TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS whatsapp_custom_message TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS target_url TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS seo_title TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS seo_description TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS seo_image TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now());
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now());
+
+-- Passo 2.3: Bloco de validação, conversão explícita e garantia de restrições
 DO $$
 DECLARE
     curr_type TEXT;
@@ -224,7 +265,7 @@ BEGIN
             ALTER TABLE public.properties ALTER COLUMN address DROP NOT NULL;
         END IF;
 
-        -- F. Garantir que 'id' possua restrição PRIMARY KEY
+        -- F. Garantir que 'id' possua restrição PRIMARY KEY (preserva se já existir)
         IF NOT EXISTS (
             SELECT 1
             FROM information_schema.table_constraints tc
@@ -238,7 +279,7 @@ BEGIN
             ALTER TABLE public.properties ADD PRIMARY KEY (id);
         END IF;
 
-        -- G. Garantir que 'slug' possua restrição UNIQUE
+        -- G. Garantir que 'slug' possua restrição UNIQUE (preserva se já existir)
         IF NOT EXISTS (
             SELECT 1
             FROM information_schema.table_constraints tc
@@ -261,42 +302,6 @@ BEGIN
 
     END IF;
 END $$;
-
--- H. Adição idempotente de todas as colunas necessárias ao gerenciador
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS id TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS slug TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS title TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS property_type TEXT DEFAULT 'Apartamento';
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS purpose TEXT DEFAULT 'venda';
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'draft';
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT false;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS tag TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS price TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS condo_fee TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS iptu TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS address TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS neighborhood TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS city TEXT DEFAULT 'Curitiba';
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS state TEXT DEFAULT 'PR';
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS bedrooms INTEGER DEFAULT 0;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS suites INTEGER DEFAULT 0;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS bathrooms INTEGER DEFAULT 0;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS parking_spots INTEGER DEFAULT 0;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS private_area NUMERIC(10, 2);
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS total_area NUMERIC(10, 2);
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS summary TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS description TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS features JSONB DEFAULT '[]'::jsonb;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS main_image TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS gallery JSONB DEFAULT '[]'::jsonb;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS video_url TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS whatsapp_custom_message TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS target_url TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS seo_title TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS seo_description TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS seo_image TEXT;
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now());
-ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now());
 
 -- ------------------------------------------------------------------------------
 -- 3. ÍNDICES DE PERFORMANCE E CONSULTA
@@ -349,15 +354,15 @@ CREATE TRIGGER trg_properties_updated_at
     EXECUTE FUNCTION public.set_properties_updated_at();
 
 -- ------------------------------------------------------------------------------
--- 6. STORAGE DEDICADO PARA FOTOS DE IMÓVEIS (property-media)
+-- 6. STORAGE DEDICADO PARA FOTOS DE IMÓVEIS (property-media) & PROTEÇÃO RESTRICTIVE
 -- ------------------------------------------------------------------------------
--- O bucket `cms-media` permanece 100% inalterado.
+-- O bucket `cms-media` e todos os outros buckets existentes permanecem 100% inalterados.
 -- Cria o bucket público exclusivo para imagens de imóveis caso não exista:
 INSERT INTO storage.buckets (id, name, public)
 VALUES ('property-media', 'property-media', true)
 ON CONFLICT (id) DO NOTHING;
 
--- Políticas de Storage restritas ao bucket `property-media`
+-- 6.1. Políticas PERMISSIVAS do módulo property-media
 DROP POLICY IF EXISTS "property_media_public_read" ON storage.objects;
 CREATE POLICY "property_media_public_read"
     ON storage.objects
@@ -386,6 +391,44 @@ CREATE POLICY "property_media_admin_delete"
     FOR DELETE
     TO authenticated
     USING (bucket_id = 'property-media' AND public.is_admin());
+
+-- 6.2. Políticas RESTRICTIVE de blindagem contra políticas genéricas antigas em storage.objects
+-- Em PostgreSQL, políticas RESTRICTIVE são combinadas via AND com qualquer política permissiva existente.
+-- Para qualquer outro bucket (bucket_id <> 'property-media'), a condição é TRUE (impacto zero em outros buckets).
+-- Para 'property-media', ela EXIGE que o usuário seja autenticado e is_admin(), bloqueando
+-- qualquer upload/modificação indevida originada de políticas antigas permissivas que possam existir.
+DROP POLICY IF EXISTS "property_media_restrictive_insert" ON storage.objects;
+CREATE POLICY "property_media_restrictive_insert"
+    ON storage.objects
+    AS RESTRICTIVE
+    FOR INSERT
+    TO public
+    WITH CHECK (
+        bucket_id <> 'property-media' OR (auth.role() = 'authenticated' AND public.is_admin())
+    );
+
+DROP POLICY IF EXISTS "property_media_restrictive_update" ON storage.objects;
+CREATE POLICY "property_media_restrictive_update"
+    ON storage.objects
+    AS RESTRICTIVE
+    FOR UPDATE
+    TO public
+    USING (
+        bucket_id <> 'property-media' OR (auth.role() = 'authenticated' AND public.is_admin())
+    )
+    WITH CHECK (
+        bucket_id <> 'property-media' OR (auth.role() = 'authenticated' AND public.is_admin())
+    );
+
+DROP POLICY IF EXISTS "property_media_restrictive_delete" ON storage.objects;
+CREATE POLICY "property_media_restrictive_delete"
+    ON storage.objects
+    AS RESTRICTIVE
+    FOR DELETE
+    TO public
+    USING (
+        bucket_id <> 'property-media' OR (auth.role() = 'authenticated' AND public.is_admin())
+    );
 
 -- ------------------------------------------------------------------------------
 -- 7. SEED: CARGA DOS 3 EMPREENDIMENTOS BASE (Publicados)
