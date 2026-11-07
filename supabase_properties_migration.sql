@@ -2,20 +2,22 @@
 -- MÁRCIO RJ CMS — MIGRAÇÃO SUPABASE: TABELA DE IMÓVEIS (VERSÃO REVISADA FINAL)
 -- STATUS: AGUARDANDO REVISÃO — NÃO EXECUTAR SEM AUTORIZAÇÃO EXPRESSA
 -- ==============================================================================
--- CORREÇÕES IMPLEMENTADAS NESTA VERSÃO:
--- 1. is_admin() RESTREITO: Utiliza claim de servidor (app_metadata -> role = 'admin')
---    e a tabela segura `public.cms_admin_users` por UUID de auth.users, sem
---    confiar exclusivamente em e-mails abertos de JWT.
--- 2. ISOLAMENTO DE STORAGE: O bucket `cms-media` permanece 100% INTOCADO.
---    Cria-se o bucket dedicado `property-media` exclusivamente para fotos públicas
---    dos imóveis, com ON CONFLICT (id) DO NOTHING e políticas isoladas.
--- 3. COMPATIBILIDADE DEFENSIVA PARA TABELAS PREEXISTENTES:
---    - NÃO apaga todas as políticas da tabela; remove apenas as suas próprias.
---    - Bloco defensivo que migra tipos de colunas antigas (ex: price, id) com USING
---      sem perda de dados e remove restrições restritivas NOT NULL antigas.
---    - Adiciona novas colunas via ADD COLUMN IF NOT EXISTS.
---
--- PRESERVAÇÃO INTEGRAL: Não altera 'leads', 'cms_pages' ou e-books existentes.
+-- AJUSTES OBRIGATÓRIOS IMPLEMENTADOS:
+-- 1. SEGURANÇA TOTAL EM `cms_admin_users`:
+--    - Removida qualquer permissão de escrita para usuários comuns.
+--    - Escrita (INSERT, UPDATE, DELETE) restrita estritamente a quem já possui a
+--      claim de servidor `app_metadata -> role = 'admin'` (ou via service_role).
+--    - Elimina completamente o risco de escalada de privilégios.
+-- 2. CONFIABILIDADE E ROBUSTEZ DA MIGRAÇÃO:
+--    - Removidos todos os blocos de supressão de erro (EXCEPTION WHEN others THEN NULL).
+--    - Conversões de tipos explícitas com USING ...::text baseadas na inspeção de
+--      information_schema.columns. Se houver erro, a migração falha imediatamente.
+--    - Verificação e garantia de PRIMARY KEY em `id`.
+--    - Verificação e garantia de restrição UNIQUE em `slug`.
+--    - Preservação integral das restrições caso já existam no banco.
+-- 3. PRESERVAÇÃO INTEGRAL:
+--    - NÃO altera a tabela `leads`, os e-books ou o bucket `cms-media`.
+--    - Storage isolado no bucket `property-media` com ON CONFLICT (id) DO NOTHING.
 -- ==============================================================================
 
 -- ------------------------------------------------------------------------------
@@ -30,18 +32,37 @@ CREATE TABLE IF NOT EXISTS public.cms_admin_users (
 
 ALTER TABLE public.cms_admin_users ENABLE ROW LEVEL SECURITY;
 
--- Política de isolamento da tabela de administradores
+-- Limpeza preventiva de políticas antigas exclusivamente nesta tabela
 DROP POLICY IF EXISTS "admin_users_isolate" ON public.cms_admin_users;
-CREATE POLICY "admin_users_isolate"
+DROP POLICY IF EXISTS "admin_users_select" ON public.cms_admin_users;
+DROP POLICY IF EXISTS "admin_users_write" ON public.cms_admin_users;
+
+-- A. Leitura: Usuários autenticados podem consultar a tabela apenas para verificar
+-- sua própria autorização ou se já possuem claim de servidor (app_metadata -> role = 'admin')
+CREATE POLICY "admin_users_select"
     ON public.cms_admin_users
-    FOR ALL
+    FOR SELECT
     TO authenticated
     USING (
         (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
         OR user_id = auth.uid()
     );
 
--- Função de autorização administrativa robusta
+-- B. Escrita (INSERT, UPDATE, DELETE): EXCLUSIVA para quem já possui a role 'admin'
+-- emitida pelo servidor no app_metadata (ou via Supabase Dashboard / service_role).
+-- Usuários comuns NUNCA podem cadastrar a si mesmos ou a terceiros.
+CREATE POLICY "admin_users_write"
+    ON public.cms_admin_users
+    FOR ALL
+    TO authenticated
+    USING (
+        (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
+    )
+    WITH CHECK (
+        (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
+    );
+
+-- Função de autorização administrativa robusta (SECURITY DEFINER)
 CREATE OR REPLACE FUNCTION public.is_admin()
 RETURNS BOOLEAN
 LANGUAGE plpgsql
@@ -55,7 +76,7 @@ BEGIN
     RETURN true;
   END IF;
 
-  -- 2. Verificação por UUID explícito cadastrado na tabela segura de administradores
+  -- 2. Verificação por UUID explícito cadastrado na tabela de administradores autorizados
   IF EXISTS (
     SELECT 1 FROM public.cms_admin_users WHERE user_id = auth.uid()
   ) THEN
@@ -67,9 +88,9 @@ END;
 $$;
 
 -- ------------------------------------------------------------------------------
--- 2. MIGRAÇÃO DEFENSIVA PARA TABELA PREEXISTENTE (public.properties)
+-- 2. TABELA DE IMÓVEIS (public.properties) & MIGRAÇÃO DEFENSIVA EXPLÍCITA
 -- ------------------------------------------------------------------------------
--- Criação base caso a tabela não exista
+-- Criação estrutural base caso a tabela não exista
 CREATE TABLE IF NOT EXISTS public.properties (
     id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     slug TEXT NOT NULL UNIQUE,
@@ -107,46 +128,141 @@ CREATE TABLE IF NOT EXISTS public.properties (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- Bloco defensivo: se a tabela já existia com outros tipos ou restrições, ajusta com segurança
+-- Bloco defensivo de validação e conversão explícita (sem silenciamento de erros)
 DO $$
+DECLARE
+    curr_type TEXT;
 BEGIN
-  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'properties') THEN
-    -- A. Conversão de tipo de id para TEXT (suporta UUIDs e chaves textuais flexíveis)
-    BEGIN
-      ALTER TABLE public.properties ALTER COLUMN id TYPE TEXT USING id::text;
-    EXCEPTION WHEN others THEN NULL;
-    END;
+    -- Executa verificações detalhadas caso a tabela 'properties' já existisse previamente
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables 
+        WHERE table_schema = 'public' AND table_name = 'properties'
+    ) THEN
 
-    -- B. Conversão de preço e taxas para TEXT (suporta "Sob Consulta" e valores formatados)
-    BEGIN
-      ALTER TABLE public.properties ALTER COLUMN price TYPE TEXT USING price::text;
-    EXCEPTION WHEN others THEN NULL;
-    END;
+        -- A. Garantir que 'id' seja TEXT (converte explicitamente caso fosse UUID ou outro tipo)
+        SELECT data_type INTO curr_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'properties' AND column_name = 'id';
 
-    BEGIN
-      ALTER TABLE public.properties ALTER COLUMN condo_fee TYPE TEXT USING condo_fee::text;
-    EXCEPTION WHEN others THEN NULL;
-    END;
+        IF curr_type IS NOT NULL AND curr_type NOT IN ('text', 'character varying') THEN
+            ALTER TABLE public.properties ALTER COLUMN id TYPE TEXT USING id::text;
+        END IF;
 
-    BEGIN
-      ALTER TABLE public.properties ALTER COLUMN iptu TYPE TEXT USING iptu::text;
-    EXCEPTION WHEN others THEN NULL;
-    END;
+        -- B. Garantir que 'price' seja TEXT (suporta "Sob Consulta" e valores formatados)
+        SELECT data_type INTO curr_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'properties' AND column_name = 'price';
 
-    -- C. Remoção preventiva de restrições NOT NULL em colunas opcionais
-    BEGIN
-      ALTER TABLE public.properties ALTER COLUMN price DROP NOT NULL;
-      ALTER TABLE public.properties ALTER COLUMN condo_fee DROP NOT NULL;
-      ALTER TABLE public.properties ALTER COLUMN iptu DROP NOT NULL;
-      ALTER TABLE public.properties ALTER COLUMN summary DROP NOT NULL;
-      ALTER TABLE public.properties ALTER COLUMN description DROP NOT NULL;
-      ALTER TABLE public.properties ALTER COLUMN address DROP NOT NULL;
-    EXCEPTION WHEN others THEN NULL;
-    END;
-  END IF;
+        IF curr_type IS NOT NULL AND curr_type NOT IN ('text', 'character varying') THEN
+            ALTER TABLE public.properties ALTER COLUMN price TYPE TEXT USING price::text;
+        END IF;
+
+        -- C. Garantir que 'condo_fee' seja TEXT
+        SELECT data_type INTO curr_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'properties' AND column_name = 'condo_fee';
+
+        IF curr_type IS NOT NULL AND curr_type NOT IN ('text', 'character varying') THEN
+            ALTER TABLE public.properties ALTER COLUMN condo_fee TYPE TEXT USING condo_fee::text;
+        END IF;
+
+        -- D. Garantir que 'iptu' seja TEXT
+        SELECT data_type INTO curr_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'properties' AND column_name = 'iptu';
+
+        IF curr_type IS NOT NULL AND curr_type NOT IN ('text', 'character varying') THEN
+            ALTER TABLE public.properties ALTER COLUMN iptu TYPE TEXT USING iptu::text;
+        END IF;
+
+        -- E. Remoção explícita de restrições NOT NULL em colunas opcionais
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'properties'
+              AND column_name = 'price' AND is_nullable = 'NO'
+        ) THEN
+            ALTER TABLE public.properties ALTER COLUMN price DROP NOT NULL;
+        END IF;
+
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'properties'
+              AND column_name = 'condo_fee' AND is_nullable = 'NO'
+        ) THEN
+            ALTER TABLE public.properties ALTER COLUMN condo_fee DROP NOT NULL;
+        END IF;
+
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'properties'
+              AND column_name = 'iptu' AND is_nullable = 'NO'
+        ) THEN
+            ALTER TABLE public.properties ALTER COLUMN iptu DROP NOT NULL;
+        END IF;
+
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'properties'
+              AND column_name = 'summary' AND is_nullable = 'NO'
+        ) THEN
+            ALTER TABLE public.properties ALTER COLUMN summary DROP NOT NULL;
+        END IF;
+
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'properties'
+              AND column_name = 'description' AND is_nullable = 'NO'
+        ) THEN
+            ALTER TABLE public.properties ALTER COLUMN description DROP NOT NULL;
+        END IF;
+
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'properties'
+              AND column_name = 'address' AND is_nullable = 'NO'
+        ) THEN
+            ALTER TABLE public.properties ALTER COLUMN address DROP NOT NULL;
+        END IF;
+
+        -- F. Garantir que 'id' possua restrição PRIMARY KEY
+        IF NOT EXISTS (
+            SELECT 1
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            WHERE tc.table_schema = 'public'
+              AND tc.table_name = 'properties'
+              AND tc.constraint_type = 'PRIMARY KEY'
+        ) THEN
+            ALTER TABLE public.properties ADD PRIMARY KEY (id);
+        END IF;
+
+        -- G. Garantir que 'slug' possua restrição UNIQUE
+        IF NOT EXISTS (
+            SELECT 1
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            WHERE tc.table_schema = 'public'
+              AND tc.table_name = 'properties'
+              AND tc.constraint_type = 'UNIQUE'
+              AND kcu.column_name = 'slug'
+        ) AND NOT EXISTS (
+            SELECT 1
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'properties'
+              AND indexdef ILIKE '%UNIQUE%slug%'
+        ) THEN
+            ALTER TABLE public.properties ADD CONSTRAINT properties_slug_key UNIQUE (slug);
+        END IF;
+
+    END IF;
 END $$;
 
--- D. Adição de novas colunas caso a tabela antiga não as possua
+-- H. Adição idempotente de todas as colunas necessárias ao gerenciador
 ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS id TEXT;
 ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS slug TEXT;
 ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS title TEXT;
@@ -183,7 +299,7 @@ ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DE
 ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now());
 
 -- ------------------------------------------------------------------------------
--- 3. ÍNDICES DE CONSULTA
+-- 3. ÍNDICES DE PERFORMANCE E CONSULTA
 -- ------------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_properties_slug ON public.properties(slug);
 CREATE INDEX IF NOT EXISTS idx_properties_status ON public.properties(status);
@@ -192,7 +308,7 @@ CREATE INDEX IF NOT EXISTS idx_properties_purpose ON public.properties(purpose);
 CREATE INDEX IF NOT EXISTS idx_properties_type ON public.properties(property_type);
 
 -- ------------------------------------------------------------------------------
--- 4. POLÍTICAS RLS ESPECÍFICAS (PRESERVANDO POLÍTICAS DE OUTROS MÓDULOS)
+-- 4. POLÍTICAS RLS ESPECÍFICAS (PRESERVANDO POLÍTICAS EXTERNAS)
 -- ------------------------------------------------------------------------------
 ALTER TABLE public.properties ENABLE ROW LEVEL SECURITY;
 
