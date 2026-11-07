@@ -58,7 +58,47 @@ export interface PartnersBlockProps extends BlockBase {
   partners: PartnerData[];
 }
 
-// 3. Bloco de Imóveis em Destaque
+// 3. Modelo Completo de Imóvel (Gerenciador de Imóveis)
+export type PropertyStatus = "published" | "draft" | "archived";
+export type PropertyPurpose = "venda" | "locacao";
+
+export interface Property {
+  id: string;
+  slug: string;
+  title: string;
+  property_type: string;
+  purpose: PropertyPurpose;
+  status: PropertyStatus;
+  featured: boolean;
+  tag?: string;
+  price: string;
+  condo_fee?: string;
+  iptu?: string;
+  neighborhood: string;
+  city: string;
+  state: string;
+  address?: string;
+  bedrooms: number;
+  suites: number;
+  bathrooms: number;
+  parking_spots: number;
+  private_area: number;
+  total_area?: number;
+  summary?: string;
+  description: string;
+  features: string[];
+  main_image: string;
+  gallery: string[];
+  video_url?: string;
+  whatsapp_custom_message?: string;
+  target_url?: string;
+  seo_title?: string;
+  seo_description?: string;
+  seo_image?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export interface PropertyData {
   id?: string;
   name: string;
@@ -67,8 +107,9 @@ export interface PropertyData {
   description: string;
   detail: string;
   image: string;
-  imageClass: string;
+  imageClass?: string;
   targetUrl?: string;
+  slug?: string;
   active?: boolean;
 }
 

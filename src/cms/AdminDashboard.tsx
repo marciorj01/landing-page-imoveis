@@ -3,7 +3,6 @@ import { useAuth } from "./AuthContext";
 import {
   SiteConfig,
   PageData,
-  PropertyItem,
   getSiteConfig,
   saveSiteConfig,
   getPageData,
@@ -11,6 +10,14 @@ import {
   uploadMedia,
 } from "../lib/cms";
 import { supabase } from "../lib/supabase";
+import { Property } from "./types";
+import {
+  getAllAdminProperties,
+  saveProperty as persistProperty,
+  deleteProperty as removeProperty,
+  duplicateProperty as cloneProperty,
+} from "./propertyService";
+import PropertyFormModal from "./PropertyFormModal";
 
 export default function AdminDashboard() {
   const { user, signOut } = useAuth();
@@ -25,9 +32,12 @@ export default function AdminDashboard() {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Modal para adicionar/editar imóvel
-  const [editingProperty, setEditingProperty] = useState<PropertyItem | null>(null);
+  // Gerenciador Completo de Imóveis
+  const [propertiesList, setPropertiesList] = useState<Property[]>([]);
+  const [editingProperty, setEditingProperty] = useState<Property | null>(null);
   const [isPropertyModalOpen, setIsPropertyModalOpen] = useState(false);
+  const [propertyFilter, setPropertyFilter] = useState<"all" | "published" | "draft" | "archived">("all");
+  const [propertySearch, setPropertySearch] = useState("");
 
   // Upload de mídia
   const [uploading, setUploading] = useState(false);
@@ -39,8 +49,10 @@ export default function AdminDashboard() {
   const loadAllData = async () => {
     const config = await getSiteConfig();
     const page = await getPageData("home");
+    const props = await getAllAdminProperties();
     setSiteConfig(config);
     setPageData(page);
+    setPropertiesList(props);
 
     // Carrega leads do Supabase
     if (supabase) {
@@ -90,38 +102,53 @@ export default function AdminDashboard() {
     setSaving(false);
   };
 
-  // Salvar imóvel (novo ou editado)
-  const handleSavePropertyModal = () => {
-    if (!editingProperty || !pageData) return;
-
-    let updatedProperties = [...pageData.properties];
-    const index = updatedProperties.findIndex((p) => p.id === editingProperty.id);
-
-    if (index >= 0) {
-      updatedProperties[index] = editingProperty;
+  // Salvar imóvel (novo ou editado no banco)
+  const handleSaveProperty = async (prop: Property) => {
+    const res = await persistProperty(prop);
+    if (res.success) {
+      const updated = await getAllAdminProperties();
+      setPropertiesList(updated);
+      setIsPropertyModalOpen(false);
+      setEditingProperty(null);
+      setSaveSuccess(true);
+      setTimeout(() => setSaveSuccess(false), 3000);
     } else {
-      updatedProperties.push({
-        ...editingProperty,
-        id: editingProperty.id || Date.now().toString(),
-      });
+      alert("Erro ao salvar imóvel: " + res.error);
     }
-
-    const newPageData = { ...pageData, properties: updatedProperties };
-    setPageData(newPageData);
-    handleSavePage(newPageData);
-    setIsPropertyModalOpen(false);
-    setEditingProperty(null);
   };
 
   // Excluir imóvel
-  const handleDeleteProperty = (id: string) => {
-    if (!pageData || !confirm("Tem certeza que deseja remover este imóvel?")) return;
-    const newPageData = {
-      ...pageData,
-      properties: pageData.properties.filter((p) => p.id !== id),
-    };
-    setPageData(newPageData);
-    handleSavePage(newPageData);
+  const handleDeleteProperty = async (id: string) => {
+    if (!confirm("Tem certeza que deseja excluir este imóvel?")) return;
+    const res = await removeProperty(id);
+    if (res.success) {
+      setPropertiesList((prev) => prev.filter((p) => p.id !== id));
+    } else {
+      alert("Erro ao excluir: " + res.error);
+    }
+  };
+
+  // Duplicar imóvel
+  const handleDuplicateProperty = async (prop: Property) => {
+    const res = await cloneProperty(prop);
+    if (res.success && res.newProperty) {
+      setPropertiesList((prev) => [res.newProperty!, ...prev]);
+      alert(`Imóvel duplicado com sucesso como rascunho!\nNovo link: /imovel/${res.newProperty.slug}`);
+    } else {
+      alert("Erro ao duplicar: " + res.error);
+    }
+  };
+
+  // Publicar / Despublicar
+  const handleToggleStatus = async (prop: Property) => {
+    const newStatus = prop.status === "published" ? "draft" : "published";
+    const updated: Property = { ...prop, status: newStatus };
+    const res = await persistProperty(updated);
+    if (res.success) {
+      setPropertiesList((prev) => prev.map((p) => (p.id === prop.id ? updated : p)));
+    } else {
+      alert("Erro ao atualizar status: " + res.error);
+    }
   };
 
   // Upload de Imagem para Supabase Storage
@@ -389,72 +416,229 @@ export default function AdminDashboard() {
           </div>
         )}
 
-        {/* TAB 2: IMÓVEIS & LANÇAMENTOS */}
-        {activeTab === "properties" && pageData && (
+        {/* TAB 2: IMÓVEIS & LANÇAMENTOS (GERENCIADOR COMPLETO) */}
+        {activeTab === "properties" && (
           <div className="space-y-6">
-            <div className="flex justify-between items-center">
-              <p className="text-xs text-white/60">
-                Gerencie os empreendimentos exibidos na seção principal de Imóveis em Destaque.
-              </p>
-              <button
-                onClick={() => {
-                  setEditingProperty({
-                    id: Date.now().toString(),
-                    name: "",
-                    tag: "Lançamento",
-                    place: "",
-                    description: "",
-                    detail: "",
-                    image: "e8527.png",
-                    targetUrl: "/oas.html",
-                    active: true,
-                  });
-                  setIsPropertyModalOpen(true);
-                }}
-                className="px-4 py-2.5 rounded-lg bg-[#c5a880] text-[#0a1128] text-xs font-bold uppercase tracking-wider hover:bg-[#d6bc96] transition"
-              >
-                + Adicionar Imóvel
-              </button>
+            {/* Barra de Status e Contadores */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div className="p-4 rounded-xl bg-white/5 border border-white/5">
+                <span className="text-2xl font-light text-white block">{propertiesList.length}</span>
+                <span className="text-[11px] text-white/50 uppercase tracking-wider">Total de Imóveis</span>
+              </div>
+              <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+                <span className="text-2xl font-light text-emerald-400 block">
+                  {propertiesList.filter((p) => p.status === "published").length}
+                </span>
+                <span className="text-[11px] text-emerald-300 uppercase tracking-wider">Publicados no Ar</span>
+              </div>
+              <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/20">
+                <span className="text-2xl font-light text-amber-400 block">
+                  {propertiesList.filter((p) => p.status === "draft").length}
+                </span>
+                <span className="text-[11px] text-amber-300 uppercase tracking-wider">Rascunhos</span>
+              </div>
+              <div className="p-4 rounded-xl bg-white/5 border border-white/5">
+                <span className="text-2xl font-light text-white/60 block">
+                  {propertiesList.filter((p) => p.status === "archived").length}
+                </span>
+                <span className="text-[11px] text-white/40 uppercase tracking-wider">Arquivados</span>
+              </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {pageData.properties.map((prop) => (
-                <div
-                  key={prop.id}
-                  className="rounded-2xl border border-white/10 bg-[#0a1128] p-5 space-y-3 relative group"
+            {/* Barra de Filtros, Busca e Botão Novo */}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-4 p-4 rounded-2xl bg-[#0a1128] border border-white/10">
+              <div className="flex flex-wrap items-center gap-2">
+                {[
+                  { id: "all", label: "Todos" },
+                  { id: "published", label: "Publicados" },
+                  { id: "draft", label: "Rascunhos" },
+                  { id: "archived", label: "Arquivados" },
+                ].map((f) => (
+                  <button
+                    key={f.id}
+                    onClick={() => setPropertyFilter(f.id as any)}
+                    className={`text-xs px-3 py-1.5 rounded-lg border transition ${
+                      propertyFilter === f.id
+                        ? "bg-[#c5a880] text-[#0a1128] border-[#c5a880] font-bold"
+                        : "border-white/15 text-white/70 hover:border-white/40"
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-3">
+                <input
+                  type="text"
+                  value={propertySearch}
+                  onChange={(e) => setPropertySearch(e.target.value)}
+                  placeholder="Buscar por nome, bairro..."
+                  className="rounded-lg border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-[#c5a880] w-full sm:w-48"
+                />
+
+                <button
+                  onClick={() => {
+                    setEditingProperty(null);
+                    setIsPropertyModalOpen(true);
+                  }}
+                  className="px-4 py-2.5 rounded-lg bg-[#c5a880] text-[#0a1128] text-xs font-bold uppercase tracking-wider hover:bg-[#d6bc96] transition shrink-0 shadow-lg"
                 >
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="px-2 py-0.5 rounded bg-[#c5a880]/20 text-[#c5a880] font-semibold uppercase text-[10px]">
-                      {prop.tag}
-                    </span>
-                    <span className="text-white/40 text-[11px]">{prop.place}</span>
-                  </div>
-
-                  <h3 className="text-lg font-light text-white">{prop.name}</h3>
-                  <p className="text-xs text-white/60 line-clamp-2">{prop.description}</p>
-                  <p className="text-[11px] text-[#c5a880] truncate">{prop.detail}</p>
-                  <p className="text-[11px] text-white/40 truncate">Destino: {prop.targetUrl}</p>
-
-                  <div className="pt-3 border-t border-white/10 flex items-center justify-between">
-                    <button
-                      onClick={() => {
-                        setEditingProperty(prop);
-                        setIsPropertyModalOpen(true);
-                      }}
-                      className="text-xs text-[#c5a880] hover:underline font-medium"
-                    >
-                      Editar Imóvel
-                    </button>
-                    <button
-                      onClick={() => handleDeleteProperty(prop.id)}
-                      className="text-xs text-red-400 hover:text-red-300 transition"
-                    >
-                      Remover
-                    </button>
-                  </div>
-                </div>
-              ))}
+                  + Novo Imóvel
+                </button>
+              </div>
             </div>
+
+            {/* Grade de Imóveis Cadastrados */}
+            {propertiesList.length === 0 ? (
+              <div className="p-12 text-center rounded-2xl border border-white/10 bg-[#0a1128] space-y-3">
+                <p className="text-sm text-white/70">Nenhum imóvel cadastrado ainda.</p>
+                <button
+                  onClick={() => {
+                    setEditingProperty(null);
+                    setIsPropertyModalOpen(true);
+                  }}
+                  className="px-5 py-2.5 rounded-lg bg-[#c5a880] text-[#0a1128] text-xs font-bold uppercase tracking-wider"
+                >
+                  Cadastrar Primeiro Imóvel
+                </button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {propertiesList
+                  .filter((p) => {
+                    if (propertyFilter !== "all" && p.status !== propertyFilter) return false;
+                    if (
+                      propertySearch &&
+                      !p.title.toLowerCase().includes(propertySearch.toLowerCase()) &&
+                      !p.neighborhood.toLowerCase().includes(propertySearch.toLowerCase()) &&
+                      !p.city.toLowerCase().includes(propertySearch.toLowerCase())
+                    ) {
+                      return false;
+                    }
+                    return true;
+                  })
+                  .map((prop) => (
+                    <div
+                      key={prop.id}
+                      className="rounded-2xl border border-white/10 bg-[#0a1128] overflow-hidden flex flex-col justify-between group hover:border-[#c5a880]/40 transition shadow-lg"
+                    >
+                      {/* Miniatura do Imóvel */}
+                      <div className="relative aspect-[16/10] bg-black/40 overflow-hidden">
+                        <img
+                          src={prop.main_image}
+                          alt={prop.title}
+                          className="w-full h-full object-cover transition duration-500 group-hover:scale-105"
+                        />
+                        <div className="absolute top-2.5 left-2.5 flex gap-1.5">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider shadow ${
+                              prop.status === "published"
+                                ? "bg-emerald-500 text-black"
+                                : prop.status === "draft"
+                                ? "bg-amber-500 text-black"
+                                : "bg-gray-600 text-white"
+                            }`}
+                          >
+                            {prop.status === "published"
+                              ? "Publicado"
+                              : prop.status === "draft"
+                              ? "Rascunho"
+                              : "Arquivado"}
+                          </span>
+
+                          <span className="px-2 py-0.5 rounded bg-black/60 text-white text-[10px] uppercase backdrop-blur-sm">
+                            {prop.purpose === "venda" ? "Venda" : "Locação"}
+                          </span>
+                        </div>
+
+                        {prop.featured && (
+                          <div className="absolute top-2.5 right-2.5">
+                            <span className="px-2 py-0.5 rounded bg-[#c5a880] text-[#0a1128] text-[10px] font-bold uppercase tracking-wider shadow">
+                              ★ Destaque Home
+                            </span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Informações */}
+                      <div className="p-4 space-y-2 flex-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-[#c5a880] font-semibold text-sm">{prop.price}</span>
+                          <span className="text-white/40 text-[11px] truncate">
+                            {prop.neighborhood ? `${prop.neighborhood}, ` : ""}{prop.city}
+                          </span>
+                        </div>
+
+                        <h3 className="text-base font-medium text-white">{prop.title}</h3>
+                        <p className="text-xs text-white/60 line-clamp-2 leading-relaxed">
+                          {prop.summary || prop.description}
+                        </p>
+
+                        <div className="pt-2 text-[11px] text-white/50 flex items-center gap-3">
+                          {prop.private_area > 0 && <span>{prop.private_area} m²</span>}
+                          {prop.bedrooms > 0 && <span>{prop.bedrooms} qts</span>}
+                          {prop.suites > 0 && <span>{prop.suites} sts</span>}
+                          {prop.parking_spots > 0 && <span>{prop.parking_spots} vag</span>}
+                        </div>
+
+                        {/* Link Direto */}
+                        <div className="pt-2">
+                          <a
+                            href={prop.status === "published" ? `/imovel/${prop.slug}` : `/preview/imovel/${prop.slug}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-[11px] text-[#c5a880] hover:underline flex items-center gap-1 font-mono"
+                          >
+                            <span>/imovel/{prop.slug}</span>
+                            <span>↗</span>
+                          </a>
+                        </div>
+                      </div>
+
+                      {/* Ações Administrativas */}
+                      <div className="p-3 bg-white/5 border-t border-white/10 flex items-center justify-between text-xs gap-1">
+                        <button
+                          onClick={() => {
+                            setEditingProperty(prop);
+                            setIsPropertyModalOpen(true);
+                          }}
+                          className="px-2.5 py-1.5 rounded bg-white/10 text-white hover:bg-white/20 transition font-medium text-[11px]"
+                        >
+                          Editar
+                        </button>
+
+                        <button
+                          onClick={() => handleDuplicateProperty(prop)}
+                          className="px-2.5 py-1.5 rounded bg-white/10 text-white/80 hover:bg-white/20 transition text-[11px]"
+                          title="Criar cópia do imóvel"
+                        >
+                          Duplicar
+                        </button>
+
+                        <button
+                          onClick={() => handleToggleStatus(prop)}
+                          className={`px-2.5 py-1.5 rounded text-[11px] font-semibold transition ${
+                            prop.status === "published"
+                              ? "bg-amber-500/20 text-amber-300 hover:bg-amber-500/30"
+                              : "bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30"
+                          }`}
+                        >
+                          {prop.status === "published" ? "Despublicar" : "Publicar"}
+                        </button>
+
+                        <button
+                          onClick={() => handleDeleteProperty(prop.id)}
+                          className="p-1.5 text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded transition text-sm"
+                          title="Excluir imóvel"
+                        >
+                          🗑️
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -742,110 +926,15 @@ export default function AdminDashboard() {
       </main>
 
       {/* Modal Adicionar / Editar Imóvel */}
-      {isPropertyModalOpen && editingProperty && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
-          <div className="relative w-full max-w-lg rounded-2xl border border-white/15 bg-[#0a1128] p-6 text-white space-y-4">
-            <div className="flex items-center justify-between border-b border-white/10 pb-3">
-              <h3 className="text-lg font-light text-white">
-                {editingProperty.name ? `Editar: ${editingProperty.name}` : "Novo Empreendimento"}
-              </h3>
-              <button
-                onClick={() => setIsPropertyModalOpen(false)}
-                className="text-white/60 hover:text-white"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs">
-              <div>
-                <label className="block text-white/70 mb-1">Nome do Imóvel</label>
-                <input
-                  type="text"
-                  value={editingProperty.name}
-                  onChange={(e) => setEditingProperty({ ...editingProperty, name: e.target.value })}
-                  placeholder="Ex: Bioma, Oás, Horizon..."
-                  className="w-full rounded-lg border border-white/15 bg-white/5 p-2 text-white"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-white/70 mb-1">Tag de Destaque</label>
-                  <input
-                    type="text"
-                    value={editingProperty.tag}
-                    onChange={(e) => setEditingProperty({ ...editingProperty, tag: e.target.value })}
-                    placeholder="Lançamento / Em obras / Pronto"
-                    className="w-full rounded-lg border border-white/15 bg-white/5 p-2 text-white"
-                  />
-                </div>
-                <div>
-                  <label className="block text-white/70 mb-1">Localização</label>
-                  <input
-                    type="text"
-                    value={editingProperty.place}
-                    onChange={(e) => setEditingProperty({ ...editingProperty, place: e.target.value })}
-                    placeholder="Ex: Curitiba - Bigorrilho"
-                    className="w-full rounded-lg border border-white/15 bg-white/5 p-2 text-white"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-white/70 mb-1">Descrição Curta</label>
-                <textarea
-                  rows={2}
-                  value={editingProperty.description}
-                  onChange={(e) => setEditingProperty({ ...editingProperty, description: e.target.value })}
-                  placeholder="Breve texto sobre o projeto..."
-                  className="w-full rounded-lg border border-white/15 bg-white/5 p-2 text-white"
-                />
-              </div>
-
-              <div>
-                <label className="block text-white/70 mb-1">Detalhes (Metragem / Entrega)</label>
-                <input
-                  type="text"
-                  value={editingProperty.detail}
-                  onChange={(e) => setEditingProperty({ ...editingProperty, detail: e.target.value })}
-                  placeholder="Ex: Plantas de 90 a 191m² | Entrega: 06/2027"
-                  className="w-full rounded-lg border border-white/15 bg-white/5 p-2 text-white"
-                />
-              </div>
-
-              <div>
-                <label className="block text-white/70 mb-1">Link de Destino ao clicar em "Ver Detalhes"</label>
-                <input
-                  type="text"
-                  value={editingProperty.targetUrl}
-                  onChange={(e) => setEditingProperty({ ...editingProperty, targetUrl: e.target.value })}
-                  placeholder="Ex: /oas.html ou /bioma.html ou link externo"
-                  className="w-full rounded-lg border border-white/15 bg-white/5 p-2 text-white font-mono"
-                />
-                <p className="text-[10px] text-white/40 mt-1">
-                  O cliente sempre preencherá o formulário de Lead antes de abrir este link.
-                </p>
-              </div>
-            </div>
-
-            <div className="pt-3 border-t border-white/10 flex justify-end gap-2">
-              <button
-                onClick={() => setIsPropertyModalOpen(false)}
-                className="px-4 py-2 rounded-lg text-xs text-white/60 hover:text-white"
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={handleSavePropertyModal}
-                className="px-5 py-2 rounded-lg bg-[#c5a880] text-[#0a1128] text-xs font-bold uppercase tracking-wider hover:bg-[#d6bc96]"
-              >
-                Salvar Imóvel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <PropertyFormModal
+        isOpen={isPropertyModalOpen}
+        onClose={() => {
+          setIsPropertyModalOpen(false);
+          setEditingProperty(null);
+        }}
+        onSave={handleSaveProperty}
+        initialProperty={editingProperty}
+      />
     </div>
   );
 }

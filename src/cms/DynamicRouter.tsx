@@ -6,6 +6,8 @@ import { DEFAULT_HOME_PAGE_SCHEMA, DEFAULT_MENU_ITEMS } from "./defaults";
 import { useAuth } from "./AuthContext";
 import LoginPage from "./LoginPage";
 import AdminDashboard from "./AdminDashboard";
+import PropertyDetailPage from "./PropertyDetailPage";
+import PropertiesListPage from "./PropertiesListPage";
 
 export default function DynamicRouter() {
   const { user, isAdmin, loading: authLoading } = useAuth();
@@ -37,19 +39,20 @@ export default function DynamicRouter() {
 
   const isPreviewRoute = currentPath.startsWith("/preview/");
   const hasPreviewParam = new URLSearchParams(currentSearch).get("preview") === "draft";
-
-  // O modo de preview é estritamente condicionado à autenticação e autorização do administrador
-  // Visitantes anônimos ou usuários comuns NUNCA podem ativar isPreview
   const isAuthorizedPreview = isAdmin && (isPreviewRoute || hasPreviewParam);
 
-  // Carrega página e menus
+  // Rotas de Imóveis
+  const isPropertiesListRoute = currentPath === "/imoveis" || currentPath === "/imoveis/";
+  const isPropertyDetailRoute = currentPath.startsWith("/imovel/");
+  const isPropertyPreviewRoute = currentPath.startsWith("/preview/imovel/");
+
+  // Carrega páginas CMS padrão
   useEffect(() => {
-    if (isAdminRoute) return;
+    if (isAdminRoute || isPropertiesListRoute || isPropertyDetailRoute || isPropertyPreviewRoute) {
+      return;
+    }
 
-    // Se estiver em rota de preview mas não for admin e ainda estiver carregando auth, aguarda
     if (isPreviewRoute && authLoading) return;
-
-    // Se estiver em rota de preview e não for admin, não carrega nada (o guard de rota cuidará)
     if (isPreviewRoute && !isAdmin) return;
 
     let isMounted = true;
@@ -90,7 +93,19 @@ export default function DynamicRouter() {
     return () => {
       isMounted = false;
     };
-  }, [currentPath, currentSearch, currentHash, isAdminRoute, isPreviewRoute, isAuthorizedPreview, authLoading, isAdmin]);
+  }, [
+    currentPath,
+    currentSearch,
+    currentHash,
+    isAdminRoute,
+    isPreviewRoute,
+    isAuthorizedPreview,
+    isPropertiesListRoute,
+    isPropertyDetailRoute,
+    isPropertyPreviewRoute,
+    authLoading,
+    isAdmin,
+  ]);
 
   // ROTA 1: Painel Administrativo do CMS
   if (isAdminRoute) {
@@ -125,12 +140,54 @@ export default function DynamicRouter() {
     return <LoginPage />;
   }
 
-  // ROTA DE PREVIEW PROTEGIDA: Se um usuário não admin acessar /preview/:slug
-  if (isPreviewRoute) {
+  // ROTA 2: Página de Listagem de Imóveis
+  if (isPropertiesListRoute) {
+    return <PropertiesListPage />;
+  }
+
+  // ROTA 3: Pré-visualização de Rascunho de Imóvel (/preview/imovel/:slug)
+  if (isPropertyPreviewRoute) {
     if (authLoading) {
       return (
         <div className="min-h-screen flex items-center justify-center bg-[#060c1d] text-[#c5a880] text-sm font-semibold tracking-wider uppercase">
           Verificando autorização de pré-visualização...
+        </div>
+      );
+    }
+
+    if (!isAdmin) {
+      return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-[#060c1d] text-white px-4 text-center">
+          <h1 className="text-3xl font-bold text-red-400 mb-3">Pré-visualização Restrita</h1>
+          <p className="text-gray-300 max-w-md mb-6">
+            A visualização de rascunhos de imóveis é exclusiva para o corretor administrador.
+          </p>
+          <a
+            href="/gestao-restrita"
+            className="px-6 py-2.5 rounded bg-[#c5a880] text-[#060c1d] font-bold text-sm uppercase tracking-wider"
+          >
+            Fazer Login
+          </a>
+        </div>
+      );
+    }
+
+    const propSlug = currentPath.replace("/preview/imovel/", "").replace(/^\//, "").replace(/\/$/, "");
+    return <PropertyDetailPage slug={propSlug} isDraft={true} />;
+  }
+
+  // ROTA 4: Página Pública de Detalhes do Imóvel (/imovel/:slug)
+  if (isPropertyDetailRoute) {
+    const propSlug = currentPath.replace("/imovel/", "").replace(/^\//, "").replace(/\/$/, "");
+    return <PropertyDetailPage slug={propSlug} isDraft={false} />;
+  }
+
+  // ROTA DE PREVIEW DE PÁGINA GENÉRICA (/preview/:slug)
+  if (isPreviewRoute) {
+    if (authLoading) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-[#060c1d] text-[#c5a880] text-sm font-semibold tracking-wider uppercase">
+          Verificando autorização...
         </div>
       );
     }
@@ -153,14 +210,14 @@ export default function DynamicRouter() {
     }
   }
 
-  // ROTA 2: Página 404 (quando uma rota dinâmica não existe)
+  // ROTA 5: Página 404
   if (pageNotFound) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center bg-[#060c1d] text-white px-4 text-center">
         <h1 className="text-4xl md:text-5xl font-bold text-[#c5a880] mb-4">404</h1>
         <h2 className="text-xl md:text-2xl font-semibold mb-2">Página não encontrada</h2>
         <p className="text-gray-400 max-w-md mb-8">
-          A página que você está procurando não existe ou ainda não foi publicada no CMS.
+          O conteúdo que você está procurando não existe ou ainda não foi publicado.
         </p>
         <a
           href="/"
@@ -172,16 +229,13 @@ export default function DynamicRouter() {
     );
   }
 
-  // ROTA 3: Site Público / Preview Autorizado
+  // ROTA 6: Site Público
   return (
     <>
       {isAuthorizedPreview && (
         <div className="bg-amber-500 text-stone-900 py-2 px-4 text-center text-xs font-bold uppercase tracking-wider sticky top-0 z-50 flex items-center justify-center gap-3 shadow-md">
-          <span>⚠️ Modo Pré-visualização: Visualizando rascunho de &quot;{pageSchema.slug}&quot; (não publicado)</span>
-          <a
-            href="/gestao-restrita"
-            className="underline hover:text-black font-extrabold ml-2"
-          >
+          <span>⚠️ Modo Pré-visualização: Visualizando rascunho de &quot;{pageSchema.slug}&quot;</span>
+          <a href="/gestao-restrita" className="underline hover:text-black font-extrabold ml-2">
             Voltar ao Painel
           </a>
         </div>
@@ -191,10 +245,7 @@ export default function DynamicRouter() {
         <div className="fixed top-0 left-0 right-0 h-1 bg-[#c5a880] animate-pulse z-50" />
       )}
 
-      <PageRenderer
-        schema={pageSchema}
-        menuItems={menus}
-      />
+      <PageRenderer schema={pageSchema} menuItems={menus} />
     </>
   );
 }
