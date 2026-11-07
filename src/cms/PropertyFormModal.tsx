@@ -62,7 +62,7 @@ export default function PropertyFormModal({
 
   const [form, setForm] = useState<Property>(
     initialProperty || {
-      id: `prop-${Date.now()}`,
+      id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `prop-${Date.now()}`,
       slug: "",
       title: "",
       property_type: "Apartamento",
@@ -752,3 +752,4 @@ export default function PropertyFormModal({
     </div>
   );
 }
+

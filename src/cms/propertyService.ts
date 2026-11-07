@@ -148,13 +148,14 @@ export async function getPublishedProperties(): Promise<Property[]> {
       .order("featured", { ascending: false })
       .order("created_at", { ascending: false });
 
-    if (error || !data || data.length === 0) {
+    if (error) {
+      console.warn("[PropertyService] Tabela de imóveis inacessível no Supabase, usando fallback padrão:", error.message);
       return DEFAULT_PROPERTIES;
     }
 
-    return data as Property[];
+    return (data || []) as Property[];
   } catch (err) {
-    console.warn("[PropertyService] Usando imóveis fallback padrão:", err);
+    console.warn("[PropertyService] Falha de conexão, usando fallback padrão:", err);
     return DEFAULT_PROPERTIES;
   }
 }
@@ -177,13 +178,15 @@ export async function getPropertyBySlug(
 
     const { data, error } = await query.maybeSingle();
 
-    if (!error && data) {
-      return data as Property;
+    if (!error) {
+      return (data as Property) || null;
     }
 
-    // Se falhar a query ao banco ou a tabela não existir, busca no fallback padrão
+    // Se falhou por erro de tabela inexistente (ex: antes da migração SQL), busca no fallback padrão
     const fallback = DEFAULT_PROPERTIES.find((p) => p.slug === cleanSlug);
     if (fallback) {
+      // Se não for rascunho e o status for published, retorna fallback
+      if (!isDraft && fallback.status !== "published") return null;
       return fallback;
     }
 
@@ -204,12 +207,13 @@ export async function getAllAdminProperties(): Promise<Property[]> {
       .select("*")
       .order("created_at", { ascending: false });
 
-    if (error || !data || data.length === 0) {
-      // Se não houver nada no banco ainda, carrega os padrões locais
+    if (error) {
+      // Apenas recorre aos padrões se houver erro técnico (ex: tabela ainda não criada)
+      console.warn("[PropertyService] Erro ao carregar imóveis do Supabase, exibindo padrão:", error.message);
       return DEFAULT_PROPERTIES;
     }
 
-    return data as Property[];
+    return (data || []) as Property[];
   } catch {
     return DEFAULT_PROPERTIES;
   }
@@ -222,6 +226,7 @@ export async function saveProperty(property: Property): Promise<{ success: boole
   try {
     const payload = {
       ...property,
+      id: property.id || (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `prop-${Date.now()}`),
       slug: property.slug ? slugify(property.slug) : slugify(property.title),
       updated_at: new Date().toISOString(),
     };
@@ -241,7 +246,7 @@ export async function saveProperty(property: Property): Promise<{ success: boole
 }
 
 /**
- * Exclui ou arquiva um imóvel
+ * Exclui um imóvel do Supabase
  */
 export async function deleteProperty(id: string): Promise<{ success: boolean; error?: string }> {
   try {
@@ -259,7 +264,7 @@ export async function deleteProperty(id: string): Promise<{ success: boolean; er
  * Duplica um imóvel criando um novo ID e slug derivado
  */
 export async function duplicateProperty(property: Property): Promise<{ success: boolean; newProperty?: Property; error?: string }> {
-  const newId = `prop-${Date.now()}`;
+  const newId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `prop-${Date.now()}`;
   const newTitle = `${property.title} (Cópia)`;
   const newSlug = `${slugify(property.slug)}-copia-${Math.random().toString(36).substring(2, 6)}`;
 
@@ -280,3 +285,4 @@ export async function duplicateProperty(property: Property): Promise<{ success: 
 
   return { success: true, newProperty: duplicated };
 }
+
